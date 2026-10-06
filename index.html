@@ -400,6 +400,11 @@
 //  Nếu dùng trực tiếp trong Apps Script thì để trống.
 // =====================================================================
 const API_URL = 'https://script.google.com/macros/s/AKfycbxPVIyoZVuL3XpGX3BCDJ_44uaHKOl-UqWgRV2RFm8rv84OsGrXinbbRpHuCb_3a2Y5/exec';
+// Bản chụp dữ liệu đặt cạnh trang này trên GitHub Pages -> mở trang là thấy ngay.
+// Được cập nhật bởi Apps Script (trang capnhat.html hoặc tự động sau khi sửa). Để '' nếu không dùng.
+const DATA_URL = 'data.json';
+const SNAPSHOT_FORMAT = 'kehoach-thithangdai/1';
+const PUBLISH_DELAY_MS = 20000; // gom các lần sửa liên tiếp, 20 giây sau lần sửa cuối mới cập nhật data.json
 
 const STATUS = ['Chưa bắt đầu', 'Đang thực hiện', 'Hoàn thành', 'Tạm hoãn'];
 const STATUS_CLS = { 'Chưa bắt đầu': 'todo', 'Đang thực hiện': 'doing', 'Hoàn thành': 'done', 'Tạm hoãn': 'hold' };
@@ -623,7 +628,13 @@ function showError(e) {
 /** Lỗi khi ghi. Mất kết nối giữa chừng thì máy chủ có thể đã lưu xong -> tải lại để hiển thị đúng. */
 function writeFailed(e) {
   showError(e);
-  if (e && e.code === 'NETWORK') load(true);
+  if (e && e.code === 'NETWORK') resyncAfterLostWrite();
+}
+
+/** Mất kết nối giữa lúc ghi: máy chủ có thể đã lưu -> khóa sửa và tải lại cho tới khi chắc chắn. */
+function resyncAfterLostWrite() {
+  state.stale = true;
+  return load(true);
 }
 
 // --------------------------- Hộp thoại ---------------------------
@@ -728,12 +739,44 @@ function findItem(name, id) { return (state.data[name] || []).find(i => i.id ===
 const LOCAL_KEY = 'data:' + (API_URL || 'apps-script');
 let syncPromise = null;
 
+const DATA_KEYS = ['settings', 'chuanBi', 'ngayThi', 'hauKy', 'nhanSu'];
+const validData = d => !!(d && d.settings && ['chuanBi', 'ngayThi', 'hauKy', 'nhanSu'].every(k => Array.isArray(d[k])));
+const sameData = (a, b) => !!a && !!b && JSON.stringify(DATA_KEYS.map(k => a[k])) === JSON.stringify(DATA_KEYS.map(k => b[k]));
+const inAppsScript = () => !!(window.google && google.script && google.script.run);
+
 function readLocal() {
   try {
     const d = JSON.parse(store.get(LOCAL_KEY, '') || 'null');
-    const ok = d && d.settings && ['chuanBi', 'ngayThi', 'hauKy', 'nhanSu'].every(k => Array.isArray(d[k]));
-    return ok ? d : null;
+    return validData(d) ? d : null;
   } catch (e) { return null; }
+}
+
+/** data.json trên GitHub Pages (tải qua CDN, thường < 0,3 giây). */
+async function readDataJson() {
+  if (!DATA_URL || inAppsScript()) return null;
+  const ctrl = window.AbortController ? new AbortController() : null;
+  const timer = ctrl && setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const r = await fetch(DATA_URL, { cache: 'no-cache', signal: ctrl ? ctrl.signal : undefined });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || j.format !== SNAPSHOT_FORMAT || !validData(j.data)) return null;
+    return Object.assign({}, j.data, { meta: { snapshotAt: j.publishedAt } });
+  } catch (e) {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Hiện dữ liệu chưa chắc mới nhất (bản sao / data.json) trong lúc chờ máy chủ. */
+function showStale(d) {
+  state.data = d;
+  state.stale = true;
+  $('#loading').hidden = true;
+  $$('.load-error').forEach(el => el.remove());
+  renderAll();
+  switchView(state.view, true);
 }
 
 function saveLocal() {
@@ -766,22 +809,41 @@ function applyData(data) {
   $('#loading').hidden = true;
   $$('.load-error').forEach(el => el.remove());
   renderAll();
-  switchView(state.view);
+  switchView(state.view, true);
 }
 
 /** Tải dữ liệu mới nhất. fresh = bỏ qua bộ nhớ đệm của máy chủ. Trả về true/false, không ném lỗi. */
 function load(fresh) {
-  if (state.data) setSync('syncing');
+  // Chỉ hiện "Đang đồng bộ…" khi việc kiểm tra kéo dài (tránh nhấp nháy) hoặc khi người dùng chủ động tải lại.
+  clearTimeout(state.badgeTimer);
+  if (state.data && fresh) setSync('syncing');
+  else state.badgeTimer = setTimeout(() => { if (state.syncing && state.data) setSync('syncing'); }, 1200);
   state.syncing = true;
   const t0 = performance.now();
   syncPromise = api('getAll', fresh ? { fresh: true } : {}, 1).then(data => {
     const meta = data.meta || {};
     state.lastLoad = { ms: Math.round(performance.now() - t0), serverMs: meta.serverMs, cached: !!meta.cached };
     state.syncing = false;
-    applyData(data);
+    clearTimeout(state.badgeTimer);
+    if (state.data && state.stale && sameData(state.data, data)) {
+      // Dữ liệu đang hiện đã đúng -> chỉ cập nhật thông tin máy chủ, không vẽ lại cả trang
+      state.data.meta = data.meta;
+      state.stale = false;
+      setSync('');
+      updateLockBadge();
+      if (!$('#view-caiDat').contains(document.activeElement)) renderSettings();
+      saveLocal();
+    } else {
+      const wasStale = state.stale;
+      const fromSnapshot = wasStale && !!(state.data && state.data.meta && state.data.meta.snapshotAt);
+      applyData(data);
+      if (wasStale) toast('Đã cập nhật dữ liệu mới nhất.', 'ok');
+      if (fromSnapshot) schedulePublish(); // data.json đang cũ hơn Google Sheets -> tự cập nhật lại
+    }
     return true;
   }, e => {
     state.syncing = false;
+    clearTimeout(state.badgeTimer);
     $('#loading').hidden = true;
     if (state.data) {
       setSync(state.stale ? 'offline' : '');
@@ -792,6 +854,32 @@ function load(fresh) {
   });
   return syncPromise;
 }
+
+// ---------- Tự cập nhật data.json sau khi sửa (gom nhiều lần sửa thành 1 lần ghi) ----------
+let publishTimer = null;
+function schedulePublish() {
+  const p = state.data && state.data.meta && state.data.meta.publish;
+  if (!p || !p.configured || !p.auto) return;
+  state.publishPending = true;
+  clearTimeout(publishTimer);
+  publishTimer = setTimeout(() => runPublish(false), PUBLISH_DELAY_MS);
+}
+function runPublish(leaving) {
+  clearTimeout(publishTimer);
+  publishTimer = null;
+  if (!state.publishPending) return;
+  state.publishPending = false;
+  if (leaving && API_URL && !inAppsScript() && navigator.sendBeacon) {
+    // Sắp rời trang: gửi luôn, trình duyệt vẫn gửi xong dù trang đã đóng
+    const body = JSON.stringify({ action: 'publish', key: store.get('key', '') });
+    if (!navigator.sendBeacon(API_URL, body)) fetch(API_URL, { method: 'POST', body, keepalive: true }).catch(() => {});
+    return;
+  }
+  api('publish').then(r => { if (r && r.changed) console.info('Đã cập nhật data.json, commit', r.commit); },
+    e => console.warn('Chưa cập nhật được data.json:', e.message));
+}
+window.addEventListener('pagehide', () => runPublish(true));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') runPublish(true); });
 
 /** Trước khi sửa: bảo đảm đang có dữ liệu mới nhất (tránh ghi đè bằng dữ liệu cũ). */
 async function ensureFresh() {
@@ -813,13 +901,13 @@ function buildShell() {
   state.view = VIEWS.some(v => v[0] === saved) ? saved : 'tongQuan';
 }
 
-function switchView(view) {
+function switchView(view, keepScroll) {
   state.view = view;
   store.set('tab', view);
   $$('.tab').forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === view)));
   if (!state.data) return;
   $$('.view').forEach(v => { v.hidden = v.id !== 'view-' + view; });
-  window.scrollTo(0, 0);
+  if (!keepScroll) window.scrollTo(0, 0);
 }
 
 function buildTableView(name) {
@@ -1089,12 +1177,12 @@ function renderSettings() {
       <h3>Thông tin kỳ thi</h3>
       <p class="muted" style="margin:0">Hiển thị ở đầu trang và trên bản in.</p>
       <div class="settings-grid">
-        <div class="field"><label for="s_tenKeHoach">Tên kế hoạch</label><input type="text" id="s_tenKeHoach" name="tenKeHoach" value="${esc(s.tenKeHoach)}"></div>
-        <div class="field"><label for="s_donVi">Đơn vị / Võ đường</label><input type="text" id="s_donVi" name="donVi" value="${esc(s.donVi)}" placeholder="VD: Võ đường …"></div>
-        <div class="field"><label for="s_ngayThi">Ngày thi</label><input type="date" id="s_ngayThi" name="ngayThi" value="${dmyToISO(s.ngayThi)}"></div>
-        <div class="field"><label for="s_diaDiem">Địa điểm thi</label><input type="text" id="s_diaDiem" name="diaDiem" value="${esc(s.diaDiem)}"></div>
-        <div class="field"><label for="s_chuanBiTu">Chuẩn bị từ ngày</label><input type="date" id="s_chuanBiTu" name="chuanBiTu" value="${dmyToISO(s.chuanBiTu)}"></div>
-        <div class="field"><label for="s_chuanBiDen">Chuẩn bị đến ngày</label><input type="date" id="s_chuanBiDen" name="chuanBiDen" value="${dmyToISO(s.chuanBiDen)}"></div>
+        <div class="field"><label for="s_tenKeHoach">Tên kế hoạch</label><input type="text" id="s_tenKeHoach" name="tenKeHoach" value="${esc(s.tenKeHoach)}" data-orig="${esc(s.tenKeHoach)}"></div>
+        <div class="field"><label for="s_donVi">Đơn vị / Võ đường</label><input type="text" id="s_donVi" name="donVi" value="${esc(s.donVi)}" data-orig="${esc(s.donVi)}" placeholder="VD: Võ đường …"></div>
+        <div class="field"><label for="s_ngayThi">Ngày thi</label><input type="date" id="s_ngayThi" name="ngayThi" value="${dmyToISO(s.ngayThi)}" data-orig="${dmyToISO(s.ngayThi)}"></div>
+        <div class="field"><label for="s_diaDiem">Địa điểm thi</label><input type="text" id="s_diaDiem" name="diaDiem" value="${esc(s.diaDiem)}" data-orig="${esc(s.diaDiem)}"></div>
+        <div class="field"><label for="s_chuanBiTu">Chuẩn bị từ ngày</label><input type="date" id="s_chuanBiTu" name="chuanBiTu" value="${dmyToISO(s.chuanBiTu)}" data-orig="${dmyToISO(s.chuanBiTu)}"></div>
+        <div class="field"><label for="s_chuanBiDen">Chuẩn bị đến ngày</label><input type="date" id="s_chuanBiDen" name="chuanBiDen" value="${dmyToISO(s.chuanBiDen)}" data-orig="${dmyToISO(s.chuanBiDen)}"></div>
       </div>
       <div class="row-actions"><button class="btn primary" type="submit">Lưu thông tin</button></div>
     </form>
@@ -1114,8 +1202,10 @@ function renderSettings() {
       <h3>Dữ liệu</h3>
       <p class="muted" style="margin:0">Toàn bộ dữ liệu được lưu trong Google Sheets. Bạn có thể mở và chỉnh sửa trực tiếp ở đó (không đổi tên dòng tiêu đề và tên trang tính).</p>
       ${loadInfo()}
+      ${publishInfoHtml()}
       <div class="row-actions">
         ${meta.sheetUrl ? `<a class="btn ghost" href="${esc(meta.sheetUrl)}" target="_blank" rel="noopener">Mở Google Sheets</a>` : ''}
+        ${DATA_URL && !inAppsScript() ? '<a class="btn ghost" href="capnhat.html">Trang cập nhật data.json</a>' : ''}
         <button class="btn danger-ghost" type="button" data-seed="1">Nạp lại dữ liệu mẫu (xóa dữ liệu hiện có)</button>
       </div>
     </div>
@@ -1131,6 +1221,18 @@ function renderSettings() {
           ${hasKey ? '<button class="btn ghost sm" type="button" id="btnForgetKey">Quên mã trên máy này</button>' : ''}` : ''}
       </div>
     </div>`;
+}
+
+function publishInfoHtml() {
+  if (!DATA_URL || inAppsScript()) return '';
+  const p = (state.data.meta || {}).publish;
+  if (!p) return '';
+  const at = state.data.meta.snapshotAt;
+  const msg = !p.configured
+    ? 'Chưa cài đặt ghi <b>data.json</b> lên GitHub — trang vẫn chạy bình thường nhưng lần mở đầu sẽ chậm hơn. Xem “Trang cập nhật data.json”.'
+    : p.auto ? '<b>data.json</b> tự cập nhật khoảng 20 giây sau mỗi lần sửa trên trang này.'
+      : 'Tự động cập nhật <b>data.json</b> đang tắt — dùng “Trang cập nhật data.json” khi cần.';
+  return `<div class="hint-box">${msg}${at ? ` Bản data.json đang hiển thị: ${esc(new Date(at).toLocaleString('vi-VN'))}.` : ''}</div>`;
 }
 
 const fmtSec = ms => (ms / 1000).toFixed(1).replace('.', ',') + ' giây';
@@ -1223,6 +1325,7 @@ $('#itemForm').addEventListener('submit', async e => {
     errEl.hidden = false;
     return;
   }
+  if (state.stale && !(await ensureFresh())) return;
   errEl.hidden = true;
   btn.disabled = true;
   btn.textContent = 'Đang lưu…';
@@ -1233,6 +1336,7 @@ $('#itemForm').addEventListener('submit', async e => {
     if (idx >= 0) list[idx] = saved; else list.push(saved);
     $('#formDialog').close();
     renderAll();
+    schedulePublish();
     toast(id ? 'Đã lưu thay đổi.' : 'Đã thêm ' + def.noun + ' mới.', 'ok');
   } catch (err) {
     if (err.code !== 'CANCEL') {
@@ -1241,7 +1345,7 @@ $('#itemForm').addEventListener('submit', async e => {
         : err.message;
       errEl.hidden = false;
       errEl.scrollIntoView({ block: 'nearest' });
-      if (err.code === 'NETWORK') load(true);
+      if (err.code === 'NETWORK') resyncAfterLostWrite();
     }
   } finally {
     btn.disabled = false;
@@ -1270,6 +1374,7 @@ async function removeItem(name, id) {
     await write('remove', { table: name, id });
     state.data[name] = state.data[name].filter(i => i.id !== id);
     renderAll();
+    schedulePublish();
     toast('Đã xóa.', 'ok');
   } catch (e) { writeFailed(e); }
 }
@@ -1277,13 +1382,20 @@ async function removeItem(name, id) {
 async function changeStatus(sel) {
   const name = sel.dataset.status, id = sel.dataset.id, value = sel.value;
   sel.className = 'status-select st-' + STATUS_CLS[value];
+  const seen = (findItem(name, id) || {}).trangThai;
   if (!(await ensureFresh())) { renderAll(); return; }
   const it = findItem(name, id);
   if (!it) { renderAll(); toast('Mục này không còn trong kế hoạch (có thể đã bị xóa).', 'err'); return; }
+  if (it.trangThai !== seen) {
+    renderAll();
+    toast(`“${it[TABLES[name].nameKey]}” vừa được cập nhật thành “${it.trangThai}”. Hãy xem lại rồi chọn lại nếu cần.`, 'err');
+    return;
+  }
   try {
     const saved = await write('update', { table: name, id, item: { trangThai: value } });
     Object.assign(it, saved);
     renderAll();
+    schedulePublish();
     toast(`Đã chuyển “${it[TABLES[name].nameKey]}” sang “${saved.trangThai}”.`, 'ok');
   } catch (e) {
     renderAll(); // trả ô trạng thái về giá trị cũ
@@ -1298,7 +1410,7 @@ async function seed(overwrite) {
   }
   try {
     await write('seed', { overwrite });
-    if (await load(true)) toast('Đã nạp dữ liệu mẫu.', 'ok');
+    if (await load(true)) { schedulePublish(); toast('Đã nạp dữ liệu mẫu.', 'ok'); }
   } catch (e) { writeFailed(e); }
 }
 
@@ -1368,6 +1480,20 @@ function showLoadError(e) {
 
 // --------------------------- Vẽ lại toàn bộ ---------------------------
 function renderAll() {
+  const a = document.activeElement;
+  const keep = a && a.id && /^(INPUT|TEXTAREA)$/.test(a.tagName) && !a.closest('dialog')
+    ? { id: a.id, start: a.selectionStart, end: a.selectionEnd } : null;
+  renderAllInner();
+  if (keep) {
+    const el = document.getElementById(keep.id);
+    if (el && el !== document.activeElement) {
+      el.focus({ preventScroll: true });
+      try { el.setSelectionRange(keep.start, keep.end); } catch (e) { /* ô ngày không hỗ trợ */ }
+    }
+  }
+}
+
+function renderAllInner() {
   const s = state.data.settings;
   $('#appTitle').textContent = s.tenKeHoach || 'Kế hoạch thi thăng đai';
   $('#appSub').textContent = [s.donVi, s.ngayThi ? 'Ngày thi: ' + fullDate(s.ngayThi) : '', s.diaDiem].filter(Boolean).join(' · ');
@@ -1429,13 +1555,16 @@ document.addEventListener('submit', async e => {
   if (e.target.id === 'settingsForm') {
     e.preventDefault();
     if (!(await ensureFresh())) return;
+    // Chỉ gửi ô đã sửa -> không ghi đè thay đổi của người khác ở các ô còn lại
     const f = e.target.elements, settings = {};
-    ['tenKeHoach', 'donVi', 'diaDiem'].forEach(k => { settings[k] = f[k].value.trim(); });
-    ['ngayThi', 'chuanBiTu', 'chuanBiDen'].forEach(k => { settings[k] = isoToDMY(f[k].value); });
+    ['tenKeHoach', 'donVi', 'diaDiem'].forEach(k => { if (f[k].value !== f[k].dataset.orig) settings[k] = f[k].value.trim(); });
+    ['ngayThi', 'chuanBiTu', 'chuanBiDen'].forEach(k => { if (f[k].value !== f[k].dataset.orig) settings[k] = isoToDMY(f[k].value); });
+    if (!Object.keys(settings).length) { toast('Không có thay đổi nào để lưu.'); return; }
     try {
       state.data.settings = await write('saveSettings', { settings });
       document.activeElement.blur();
       renderAll();
+      schedulePublish();
       toast('Đã lưu thông tin kỳ thi.', 'ok');
     } catch (err) { writeFailed(err); }
   } else if (e.target.id === 'rolloverForm') {
@@ -1452,7 +1581,8 @@ document.addEventListener('submit', async e => {
     try {
       const res = await write('rollover', { ngayThi: nd, resetStatus: reset });
       document.activeElement.blur();
-      if (await load(true)) toast(`Đã dời lịch ${res.delta >= 0 ? '+' : ''}${res.delta} ngày.`, 'ok');
+      if (await load(true)) schedulePublish();
+      if (state.data && !state.stale) toast(`Đã dời lịch ${res.delta >= 0 ? '+' : ''}${res.delta} ngày.`, 'ok');
     } catch (err) { writeFailed(err); }
   }
 });
@@ -1462,16 +1592,18 @@ window.addEventListener('afterprint', () => { $('#printArea').innerHTML = ''; })
 buildShell();
 (function boot() {
   const initial = readInitial();
-  if (initial) { applyData(initial); return; }      // chạy trong Apps Script: có sẵn dữ liệu
-  const cached = readLocal();
-  if (cached) {                                      // hiện ngay dữ liệu lần trước, đồng bộ ở nền
-    state.data = cached;
-    state.stale = true;
-    $('#loading').hidden = true;
-    renderAll();
+  if (initial) { applyData(initial); return; }   // chạy trong Apps Script: có sẵn dữ liệu
+  const local = readLocal();                      // 1) bản sao lần trước trong trình duyệt: hiện tức thì
+  if (local) showStale(local);
+  else switchView(state.view);
+  load(false);                                    // 2) hỏi Apps Script ở nền (song song)
+  if (!local) {                                   // 3) lần đầu mở trên máy này: dùng data.json
+    readDataJson().then(d => {
+      if (!d || state.data) return;
+      showStale(d);
+      if (!state.syncing) setSync('offline'); // máy chủ đã báo lỗi trước khi data.json về
+    });
   }
-  switchView(state.view);
-  load(false);
 })();
 </script>
 </body>

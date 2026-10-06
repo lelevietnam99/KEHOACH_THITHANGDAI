@@ -8,6 +8,8 @@
  *
  *  Tốc độ: mỗi trang tính chỉ được đọc 1 lần cho mỗi lượt tải, và kết quả được
  *  giữ trong bộ nhớ đệm (CacheService) cho tới khi dữ liệu thay đổi.
+ *  Ngoài ra script có thể ghi bản chụp dữ liệu ra file data.json trên GitHub
+ *  (GitHub Pages) để trang web hiển thị tức thì — xem phần "DATA.JSON / GITHUB".
  *
  *  Có thể sửa trực tiếp trong Google Sheets, KHÔNG đổi tên dòng tiêu đề
  *  (dòng 1) và KHÔNG đổi tên các trang tính bên dưới.
@@ -25,6 +27,15 @@ const PROP_SHEET_ID = 'SPREADSHEET_ID';    // Chỉ cần khi script KHÔNG gắ
 const PROP_VER = 'PHIEN_BAN_DU_LIEU';      // Tự đổi mỗi khi dữ liệu thay đổi (để làm mới bộ nhớ đệm)
 const CACHE_PREFIX = 'getAll:v2:';
 const CACHE_TTL = 300;                     // Bộ nhớ đệm tự hết hạn sau 5 phút
+
+// Ghi data.json lên GitHub (tùy chọn). Cài đặt qua menu "🥋 Thi thăng đai → Cài đặt cập nhật data.json".
+const PROP_GH_TOKEN = 'GITHUB_TOKEN';      // Mã truy cập GitHub (fine-grained, quyền Contents: Read and write)
+const PROP_GH_REPO = 'GITHUB_REPO';        // Kho GitHub, ví dụ: lelevietnam99/KEHOACH_THITHANGDAI
+const PROP_GH_BRANCH = 'GITHUB_BRANCH';    // Nhánh chạy GitHub Pages (mặc định: main)
+const PROP_GH_PATH = 'GITHUB_PATH';        // Đường dẫn file (mặc định: data.json)
+const PROP_PUB_LAST = 'DATA_JSON_LAST';    // Thông tin lần ghi data.json gần nhất
+const PROP_PUB_AUTO = 'DATA_JSON_AUTO';    // 'off' = tắt tự động cập nhật data.json sau khi sửa
+const SNAPSHOT_FORMAT = 'kehoach-thithangdai/1';
 
 // Mỗi cột: [khóa nội bộ, tiêu đề trong Google Sheets, độ rộng cột]
 const TABLES = {
@@ -149,6 +160,9 @@ const ACTIONS = {
   saveSettings: { auth: true, write: true, run: req => saveSettings_(req.settings) },
   seed: { auth: true, write: true, run: req => seed_(!!req.overwrite) },
   rollover: { auth: true, write: true, run: req => rollover_(req.ngayThi, !!req.resetStatus) },
+  snapshot: { run: () => buildSnapshot_().snap },          // nội dung data.json (để tải về máy)
+  status: { run: () => publishStatus_() },                 // trạng thái data.json cho trang capnhat.html
+  publish: { auth: true, run: req => publish_(!!req.force) }, // ghi data.json lên GitHub
 };
 
 /** Điểm vào duy nhất của API (gọi qua google.script.run hoặc doPost). */
@@ -179,18 +193,24 @@ function getAll_(fresh) {
   let data = fresh ? null : cacheGet_(key);
   const hit = !!data;
   if (!data) {
-    try {
-      data = readAll_(true);                    // chỉ đọc, không cần khóa
-    } catch (e) {
-      if (e.code !== 'NEEDS_WRITE') throw e;
-      data = withLock_(() => readAll_(false));  // lần đầu: cần tạo trang tính / cấp ID -> khóa rồi đọc lại
-    }
+    data = readFresh_();
     cachePut_(key, data);
   }
   data.meta.authRequired = !!getProp_(PROP_KEY);
+  data.meta.publish = publishInfo_();
   data.meta.cached = hit;
   data.meta.serverMs = Date.now() - t0;
   return data;
+}
+
+/** Đọc thẳng từ Google Sheets: không khóa; nếu cần tạo trang tính / cấp ID thì khóa rồi đọc lại. */
+function readFresh_() {
+  try {
+    return readAll_(true);
+  } catch (e) {
+    if (e.code !== 'NEEDS_WRITE') throw e;
+    return withLock_(() => readAll_(false));
+  }
 }
 
 function readAll_(readOnly) {
@@ -497,6 +517,161 @@ function settingsFromValues_(values) {
   return out;
 }
 
+// ------------------------- DATA.JSON / GITHUB -------------------------
+//
+// data.json = bản chụp toàn bộ kế hoạch, đặt cạnh index.html trên GitHub Pages.
+// Trang web đọc data.json (rất nhanh, qua CDN của GitHub) để hiển thị ngay,
+// rồi mới hỏi Apps Script ở nền xem có dữ liệu mới hơn không.
+// Cấu trúc:
+//   { format, version, publishedAt, hash, data: { settings, chuanBi, ngayThi, hauKy, nhanSu } }
+//   hash = SHA-256 của JSON phần "data" -> so sánh để biết data.json đã khớp Google Sheets chưa.
+
+/** Phần dữ liệu đưa vào data.json (không có thông tin máy chủ như đường link Google Sheet). */
+function dataPart_(all) {
+  return { settings: all.settings, chuanBi: all.chuanBi, ngayThi: all.ngayThi, hauKy: all.hauKy, nhanSu: all.nhanSu };
+}
+
+/** Đọc mới từ Google Sheets và dựng nội dung data.json. Đồng thời làm mới bộ nhớ đệm của getAll. */
+function buildSnapshot_() {
+  const version = getProp_(PROP_VER) || '0'; // lấy phiên bản TRƯỚC khi đọc dữ liệu
+  const all = readFresh_();
+  cachePut_(CACHE_PREFIX + version, all);
+  const data = dataPart_(all);
+  const snap = {
+    format: SNAPSHOT_FORMAT,
+    version: version,
+    publishedAt: new Date().toISOString(),
+    hash: sha256_(JSON.stringify(data)),
+    data: data,
+  };
+  return { snap: snap };
+}
+
+function publishInfo_() {
+  return {
+    configured: !!(getProp_(PROP_GH_TOKEN) && getProp_(PROP_GH_REPO)),
+    auto: getProp_(PROP_PUB_AUTO) !== 'off',
+  };
+}
+
+/** Trạng thái cho trang capnhat.html (không bao giờ trả mã truy cập GitHub). */
+function publishStatus_() {
+  const all = getAll_(false);
+  const info = publishInfo_();
+  let last = null;
+  try { last = JSON.parse(getProp_(PROP_PUB_LAST) || 'null'); } catch (e) { last = null; }
+  return {
+    configured: info.configured,
+    auto: info.auto,
+    repo: getProp_(PROP_GH_REPO),
+    branch: getProp_(PROP_GH_BRANCH) || 'main',
+    path: getProp_(PROP_GH_PATH) || 'data.json',
+    last: last,
+    current: {
+      hash: sha256_(JSON.stringify(dataPart_(all))),
+      counts: { chuanBi: all.chuanBi.length, ngayThi: all.ngayThi.length, hauKy: all.hauKy.length, nhanSu: all.nhanSu.length },
+    },
+    authRequired: all.meta.authRequired,
+  };
+}
+
+/** Ghi data.json lên GitHub. Bỏ qua nếu nội dung không đổi (trừ khi force). */
+function publish_(force) {
+  const cfg = ghConfig_();
+  const snap = buildSnapshot_().snap;
+  const url = '/repos/' + cfg.repo + '/contents/' + cfg.path.split('/').map(encodeURIComponent).join('/');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = gh_('get', url + '?ref=' + encodeURIComponent(cfg.branch));
+    if (cur.code !== 200 && cur.code !== 404) throw ghError_(cur, cfg);
+    const sha = cur.code === 200 ? cur.json.sha : null;
+    if (sha && !force) {
+      const old = decodeGhJson_(cur.json.content);
+      if (old && old.hash === snap.hash) {
+        return recordPublish_({ changed: false, hash: snap.hash, version: snap.version, publishedAt: old.publishedAt || '' });
+      }
+    }
+    const body = {
+      message: 'Cập nhật ' + cfg.path + ' từ Google Sheets (' + now_() + ')',
+      content: Utilities.base64Encode(JSON.stringify(snap), Utilities.Charset.UTF_8),
+      branch: cfg.branch,
+    };
+    if (sha) body.sha = sha;
+    const put = gh_('put', url, body);
+    if (put.code === 200 || put.code === 201) {
+      const commit = (put.json && put.json.commit) || {};
+      return recordPublish_({
+        changed: true, hash: snap.hash, version: snap.version, publishedAt: snap.publishedAt,
+        commit: commit.sha ? String(commit.sha).slice(0, 7) : '', commitUrl: commit.html_url || '',
+      });
+    }
+    if (put.code !== 409 && put.code !== 422) throw ghError_(put, cfg);
+    // 409/422: data.json vừa bị người khác ghi -> đọc lại sha rồi thử lại
+  }
+  throw err_('GitHub đang bận (có người khác cũng đang cập nhật data.json). Vui lòng thử lại sau giây lát.');
+}
+
+function recordPublish_(res) {
+  res.at = new Date().toISOString();
+  try {
+    PropertiesService.getScriptProperties().setProperty(PROP_PUB_LAST, JSON.stringify(res));
+  } catch (e) { /* không quan trọng */ }
+  return res;
+}
+
+function ghConfig_() {
+  const token = getProp_(PROP_GH_TOKEN);
+  const repo = getProp_(PROP_GH_REPO);
+  if (!token || !repo) {
+    throw err_('Chưa cài đặt cập nhật data.json lên GitHub. Trong Google Sheet, chọn menu ' +
+      '"🥋 Thi thăng đai → Cài đặt cập nhật data.json (GitHub)".', 'NOT_CONFIGURED');
+  }
+  return {
+    token: token,
+    repo: repo.replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '').replace(/\/+$/, ''),
+    branch: getProp_(PROP_GH_BRANCH) || 'main',
+    path: getProp_(PROP_GH_PATH) || 'data.json',
+  };
+}
+
+function gh_(method, path, payload, token) {
+  const res = UrlFetchApp.fetch('https://api.github.com' + path, {
+    method: method,
+    contentType: 'application/json',
+    payload: payload ? JSON.stringify(payload) : undefined,
+    headers: {
+      Authorization: 'Bearer ' + (token || getProp_(PROP_GH_TOKEN)),
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    muteHttpExceptions: true,
+  });
+  let json = null;
+  try { json = JSON.parse(res.getContentText() || 'null'); } catch (e) { json = null; }
+  return { code: res.getResponseCode(), json: json };
+}
+
+function ghError_(res, cfg) {
+  const msg = (res.json && res.json.message) || ('HTTP ' + res.code);
+  if (res.code === 401) return err_('GitHub từ chối mã truy cập (sai hoặc đã hết hạn). Hãy tạo mã mới rồi cài đặt lại.', 'GITHUB');
+  if (res.code === 403) return err_('Mã truy cập GitHub không có quyền ghi vào kho ' + cfg.repo + ' (cần quyền "Contents: Read and write"). ' + msg, 'GITHUB');
+  if (res.code === 404) return err_('Không tìm thấy kho "' + cfg.repo + '" hoặc nhánh "' + cfg.branch + '" (hoặc mã truy cập không được cấp quyền cho kho này).', 'GITHUB');
+  return err_('GitHub báo lỗi: ' + msg, 'GITHUB');
+}
+
+function decodeGhJson_(content) {
+  try {
+    const bytes = Utilities.base64Decode(String(content || '').replace(/\s/g, ''));
+    return JSON.parse(Utilities.newBlob(bytes).getDataAsString('UTF-8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function sha256_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8)
+    .map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
 // ------------------------- BỘ NHỚ ĐỆM / KHÓA -------------------------
 
 function cacheGet_(key) {
@@ -698,6 +873,10 @@ function onOpen() {
     .addItem('Đặt / đổi mã quản trị', 'menuDatMaQuanTri')
     .addItem('Xóa mã quản trị', 'menuXoaMaQuanTri')
     .addSeparator()
+    .addItem('Cài đặt cập nhật data.json (GitHub)', 'menuCaiDatGitHub')
+    .addItem('Cập nhật data.json ngay', 'menuCapNhatDataJson')
+    .addItem('Bật / tắt tự động cập nhật data.json', 'menuTuDongDataJson')
+    .addSeparator()
     .addItem('Nạp lại dữ liệu mẫu (XÓA dữ liệu hiện có)', 'menuNapLaiDuLieuMau')
     .addToUi();
 }
@@ -749,6 +928,64 @@ function menuXoaMaQuanTri() {
     ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
   PropertiesService.getScriptProperties().deleteProperty(PROP_KEY);
   ui.alert('Đã xóa mã quản trị.');
+}
+
+/** Lưu kho / nhánh / mã truy cập GitHub rồi thử kết nối. */
+function menuCaiDatGitHub() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const curRepo = props.getProperty(PROP_GH_REPO) || '';
+  const curBranch = props.getProperty(PROP_GH_BRANCH) || 'main';
+  const ask = (title, msg) => {
+    const r = ui.prompt(title, msg, ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) throw err_('CANCEL', 'CANCEL');
+    return r.getResponseText().trim();
+  };
+  try {
+    const repo = ask('1/3 · Kho GitHub', 'Nhập tên kho dạng  chủ-sở-hữu/tên-kho  (ví dụ: lelevietnam99/KEHOACH_THITHANGDAI).' +
+      (curRepo ? '\nĐang dùng: ' + curRepo + ' — để trống = giữ nguyên.' : '')) || curRepo;
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { ui.alert('Tên kho không hợp lệ: "' + repo + '"'); return; }
+    const branch = ask('2/3 · Nhánh', 'Nhánh đang chạy GitHub Pages. Đang dùng: ' + curBranch + ' — để trống = giữ nguyên.') || curBranch;
+    const token = ask('3/3 · Mã truy cập GitHub', 'Dán mã truy cập (Personal access token) có quyền "Contents: Read and write" cho kho ' + repo + '.' +
+      (props.getProperty(PROP_GH_TOKEN) ? '\nĐể trống = giữ mã cũ.' : '')) || props.getProperty(PROP_GH_TOKEN) || '';
+    if (!token) { ui.alert('Chưa nhập mã truy cập GitHub.'); return; }
+    const test = gh_('get', '/repos/' + repo, null, token);
+    if (test.code !== 200) { ui.alert('Không kết nối được: ' + ghError_(test, { repo: repo, branch: branch }).message); return; }
+    if (test.json && test.json.permissions && test.json.permissions.push === false) {
+      ui.alert('Mã truy cập này chỉ có quyền đọc kho ' + repo + '. Hãy cấp quyền "Contents: Read and write".');
+      return;
+    }
+    props.setProperties({ [PROP_GH_REPO]: repo, [PROP_GH_BRANCH]: branch, [PROP_GH_TOKEN]: token });
+    PROPS_MEMO_ = null;
+    const res = publish_(true);
+    ui.alert('Đã kết nối GitHub và ghi data.json' + (res.commit ? ' (commit ' + res.commit + ')' : '') +
+      '.\nGitHub Pages sẽ phát hành bản mới sau khoảng 1 phút.');
+  } catch (e) {
+    if (e.code !== 'CANCEL') ui.alert('Lỗi: ' + e.message);
+  }
+}
+
+function menuCapNhatDataJson() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const res = publish_(true);
+    ui.alert('Đã ghi data.json lên GitHub' + (res.commit ? ' (commit ' + res.commit + ')' : '') +
+      '.\nGitHub Pages sẽ phát hành bản mới sau khoảng 1 phút.');
+  } catch (e) {
+    ui.alert('Lỗi: ' + e.message);
+  }
+}
+
+function menuTuDongDataJson() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+  const on = props.getProperty(PROP_PUB_AUTO) !== 'off';
+  if (ui.alert(on ? 'Đang BẬT tự động cập nhật data.json' : 'Đang TẮT tự động cập nhật data.json',
+    on ? 'Sau mỗi lần sửa trên trang web, data.json được cập nhật sau ~20 giây. Bạn muốn TẮT?'
+       : 'Bạn muốn BẬT lại? (data.json sẽ tự cập nhật ~20 giây sau mỗi lần sửa trên trang web)',
+    ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
+  props.setProperty(PROP_PUB_AUTO, on ? 'off' : 'on');
+  ui.alert(on ? 'Đã tắt. Dùng trang capnhat.html hoặc menu để cập nhật thủ công.' : 'Đã bật.');
 }
 
 function menuNapLaiDuLieuMau() {

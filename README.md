@@ -25,6 +25,9 @@ Dữ liệu lưu trong **Google Sheets**, giao diện web cho phép **Thêm / Xe
 |---|---|
 | `Code.gs` | Máy chủ Google Apps Script: đọc/ghi Google Sheets, API, menu trong Sheets, dữ liệu mẫu từ PDF. |
 | `index.html` | Toàn bộ giao diện web (HTML + CSS + JavaScript, một file duy nhất). |
+| `capnhat.html` | Trang cập nhật `data.json` (xem trạng thái, cập nhật ngay, tải về máy). |
+| `data.json` | Bản chụp dữ liệu kế hoạch để trang mở tức thì. Do Apps Script tự tạo — không cần sửa tay. |
+| `.nojekyll` | Giúp GitHub Pages phát hành nhanh hơn (bỏ qua bước Jekyll). |
 
 ---
 
@@ -98,3 +101,53 @@ Sau khi sửa `Code.gs` hoặc `Index.html`, trang web **chưa đổi ngay**. C�
 
 **Triển khai (Deploy) → Quản lý các lần triển khai (Manage deployments)** → chọn bản đang dùng → ✏️ **Chỉnh sửa** →
 mục **Phiên bản (Version)** chọn **Phiên bản mới (New version)** → **Triển khai**.
+
+---
+
+## ⚡ Tăng tốc bằng `data.json` (khi dùng GitHub Pages)
+
+Apps Script luôn mất vài giây để trả lời. Vì vậy trang web đọc trước file tĩnh **`data.json`** (đặt cạnh `index.html` trên GitHub Pages, tải gần như tức thì), hiện kế hoạch ngay, rồi mới hỏi Apps Script ở nền xem có dữ liệu mới hơn không.
+
+```
+Mở trang ──► data.json (≈0,1 giây) ──► hiện kế hoạch ngay
+        └──► Apps Script (vài giây, chạy nền) ──► có thay đổi thì tự cập nhật màn hình
+Sửa trên web ──► Apps Script ghi Google Sheets ──► ~20 giây sau tự ghi data.json lên GitHub
+```
+
+**Cấu trúc `data.json`:**
+
+```json
+{
+  "format": "kehoach-thithangdai/1",
+  "version": "…",
+  "publishedAt": "2026-10-06T09:38:37.000Z",
+  "hash": "sha256 của phần data",
+  "data": { "settings": {…}, "chuanBi": […], "ngayThi": […], "hauKy": […], "nhanSu": […] }
+}
+```
+
+### Cài đặt (một lần)
+
+1. **Tạo mã truy cập GitHub:** ảnh đại diện → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**
+   - *Repository access*: **Only select repositories** → chọn kho này.
+   - *Permissions → Repository permissions → Contents*: **Read and write**.
+   - Bấm **Generate token** và sao chép mã (bắt đầu bằng `github_pat_`).
+2. **Dán `Code.gs` mới** vào Apps Script → Lưu.
+3. **Tải lại (F5) Google Sheet** để thấy menu mới, rồi chọn **🥋 Thi thăng đai → Cài đặt cập nhật data.json (GitHub)**. Nhập tên kho (ví dụ `lelevietnam99/KEHOACH_THITHANGDAI`) và nhánh (`main`), rồi dán mã.
+   Google sẽ hỏi thêm quyền **“kết nối tới dịch vụ bên ngoài”**: bấm **Cho phép**. Quyền này cần để Apps Script ghi được lên GitHub.
+4. **Triển khai phiên bản mới** của Web App: **Triển khai → Quản lý các lần triển khai → ✏️ → Phiên bản mới → Triển khai**.
+5. Đưa `index.html`, `capnhat.html`, `.nojekyll` lên nhánh chạy GitHub Pages.
+
+> ⚠️ Phải làm bước 3 (cấp quyền) **trước** bước 4. Nếu chưa cấp quyền mà đã triển khai, Web App sẽ báo lỗi “cần cấp quyền”.
+
+### Sử dụng
+
+- **Tự động:** sau mỗi lần thêm/sửa/xóa trên trang kế hoạch, `data.json` tự cập nhật sau khoảng 20 giây (gom nhiều lần sửa thành một lần ghi).
+  Bật/tắt bằng menu **🥋 Thi thăng đai → Bật / tắt tự động cập nhật data.json**.
+- **Thủ công:** mở **`capnhat.html`** (hoặc **Cài đặt → Trang cập nhật data.json**) để xem `data.json` đã khớp Google Sheets chưa, rồi bấm **Cập nhật data.json ngay**.
+  Nên dùng sau khi sửa trực tiếp trong Google Sheets.
+- **Không muốn tạo mã GitHub?** Trên `capnhat.html` bấm **Tải data.json về máy**, rồi tải file lên kho GitHub (**Add file → Upload files → Commit changes**).
+- `data.json` cũ hơn Google Sheets cũng **không làm sai dữ liệu**: trang vẫn tự hiện bản mới nhất sau vài giây. Trang cũng chỉ cho sửa khi đã có dữ liệu mới nhất.
+
+> 🔒 `data.json` nằm trong kho GitHub công khai, nên ai cũng xem được (giống như trang web). Đừng ghi số điện thoại hay thông tin riêng tư vào kế hoạch.
+> Mã truy cập GitHub chỉ lưu trong *Thuộc tính tập lệnh* của Apps Script, không bao giờ gửi ra trình duyệt.
