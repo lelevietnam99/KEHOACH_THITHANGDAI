@@ -129,6 +129,7 @@ Sửa trên web ──► Apps Script ghi Google Sheets ──► ~20 giây sau 
 ### Cài đặt (một lần)
 
 1. **Tạo mã truy cập GitHub:** ảnh đại diện → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**
+   - *Expiration*: chọn thời hạn dài (ví dụ 1 năm). **Khi mã hết hạn, `data.json` sẽ ngừng cập nhật.** Lúc đó Cài đặt và `capnhat.html` sẽ báo lỗi; bạn tạo mã mới rồi chạy lại menu cài đặt GitHub.
    - *Repository access*: **Only select repositories** → chọn kho này.
    - *Permissions → Repository permissions → Contents*: **Read and write**.
    - Bấm **Generate token** và sao chép mã (bắt đầu bằng `github_pat_`).

@@ -137,7 +137,7 @@
       <summary>Xem các bước</summary>
       <ol class="guide">
         <li>Trên GitHub: ảnh đại diện → <b>Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token</b>.</li>
-        <li>Đặt tên (vd: <code>data-json</code>), <b>Expiration</b> tùy chọn; <b>Repository access</b>: <b>Only select repositories</b> → chọn kho của trang này.</li>
+        <li>Đặt tên (vd: <code>data-json</code>); <b>Expiration</b>: chọn thời hạn dài (vd: 1 năm) — <b>khi mã hết hạn, data.json sẽ ngừng cập nhật</b> (trang này và mục Cài đặt sẽ báo lỗi), lúc đó tạo mã mới và cài đặt lại; <b>Repository access</b>: <b>Only select repositories</b> → chọn kho của trang này.</li>
         <li><b>Permissions → Repository permissions → Contents</b>: chọn <b>Read and write</b> → <b>Generate token</b> → sao chép mã (bắt đầu bằng <code>github_pat_</code>).</li>
         <li>Mở Google Sheet → menu <b>🥋 Thi thăng đai → Cài đặt cập nhật data.json (GitHub)</b> → nhập tên kho, nhánh (<code>main</code>) và dán mã. Google sẽ hỏi quyền <i>“kết nối tới dịch vụ bên ngoài”</i> → <b>Cho phép</b>.</li>
         <li>Xong! Từ giờ sau mỗi lần sửa trên trang kế hoạch, <code>data.json</code> tự cập nhật sau ~20 giây; trang này dùng khi muốn cập nhật ngay (ví dụ sau khi sửa trực tiếp trong Google Sheets).</li>

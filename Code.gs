@@ -626,8 +626,9 @@ function publishInner_(force) {
       });
     }
     lastMsg = (put.json && put.json.message) || ('HTTP ' + put.code);
-    // Chỉ thử lại khi data.json vừa bị lượt khác ghi (sha đã đổi); lỗi khác báo ngay
-    if (put.code !== 409 && !(put.code === 422 && /sha/i.test(lastMsg))) throw ghError_(put, cfg);
+    // Chỉ thử lại khi data.json vừa bị lượt khác ghi (sha đã đổi); lỗi khác (quy tắc nhánh, kiểm tra...) báo ngay
+    const shaRace = (put.code === 409 || put.code === 422) && /is at .* but expected|sha/i.test(lastMsg);
+    if (!shaRace) throw ghError_(put, cfg);
   }
   throw err_('Không ghi được data.json sau 3 lần thử vì file liên tục bị thay đổi (' + lastMsg + '). Vui lòng thử lại sau giây lát.', 'GITHUB');
 }
