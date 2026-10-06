@@ -1554,12 +1554,13 @@ document.addEventListener('change', e => {
 document.addEventListener('submit', async e => {
   if (e.target.id === 'settingsForm') {
     e.preventDefault();
-    if (!(await ensureFresh())) return;
-    // Chỉ gửi ô đã sửa -> không ghi đè thay đổi của người khác ở các ô còn lại
+    // Đọc biểu mẫu TRƯỚC khi chờ đồng bộ (đồng bộ xong có thể vẽ lại biểu mẫu).
+    // Chỉ gửi ô đã sửa -> không ghi đè thay đổi của người khác ở các ô còn lại.
     const f = e.target.elements, settings = {};
     ['tenKeHoach', 'donVi', 'diaDiem'].forEach(k => { if (f[k].value !== f[k].dataset.orig) settings[k] = f[k].value.trim(); });
     ['ngayThi', 'chuanBiTu', 'chuanBiDen'].forEach(k => { if (f[k].value !== f[k].dataset.orig) settings[k] = isoToDMY(f[k].value); });
     if (!Object.keys(settings).length) { toast('Không có thay đổi nào để lưu.'); return; }
+    if (!(await ensureFresh())) return;
     try {
       state.data.settings = await write('saveSettings', { settings });
       document.activeElement.blur();
@@ -1569,10 +1570,10 @@ document.addEventListener('submit', async e => {
     } catch (err) { writeFailed(err); }
   } else if (e.target.id === 'rolloverForm') {
     e.preventDefault();
-    if (!(await ensureFresh())) return;
-    const nd = isoToDMY($('#r_date').value);
+    const nd = isoToDMY(e.target.elements.namedItem('r_date').value); // đọc trước khi chờ đồng bộ
+    const reset = e.target.elements.namedItem('r_reset').checked;
     if (!nd) { toast('Hãy chọn ngày thi mới.', 'err'); return; }
-    const reset = $('#r_reset').checked;
+    if (!(await ensureFresh())) return;
     const ok = await confirmBox({
       title: 'Dời lịch sang kỳ thi mới?', danger: false, ok: 'Dời lịch',
       message: `Ngày thi sẽ đổi thành ${fullDate(nd)}. Mọi deadline sẽ được dời theo${reset ? ' và mọi trạng thái được đặt lại về “Chưa bắt đầu”' : ''}.`,

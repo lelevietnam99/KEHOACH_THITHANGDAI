@@ -132,13 +132,16 @@ Sửa trên web ──► Apps Script ghi Google Sheets ──► ~20 giây sau 
    - *Repository access*: **Only select repositories** → chọn kho này.
    - *Permissions → Repository permissions → Contents*: **Read and write**.
    - Bấm **Generate token** và sao chép mã (bắt đầu bằng `github_pat_`).
-2. **Dán `Code.gs` mới** vào Apps Script → Lưu.
-3. **Tải lại (F5) Google Sheet** để thấy menu mới, rồi chọn **🥋 Thi thăng đai → Cài đặt cập nhật data.json (GitHub)**. Nhập tên kho (ví dụ `lelevietnam99/KEHOACH_THITHANGDAI`) và nhánh (`main`), rồi dán mã.
-   Google sẽ hỏi thêm quyền **“kết nối tới dịch vụ bên ngoài”**: bấm **Cho phép**. Quyền này cần để Apps Script ghi được lên GitHub.
-4. **Triển khai phiên bản mới** của Web App: **Triển khai → Quản lý các lần triển khai → ✏️ → Phiên bản mới → Triển khai**.
-5. Đưa `index.html`, `capnhat.html`, `.nojekyll` lên nhánh chạy GitHub Pages.
+2. **Dán `Code.gs` mới** vào Apps Script → **Lưu** → **tải lại (F5) Google Sheet**.
+3. Trong Google Sheet: menu **🥋 Thi thăng đai → Cài đặt ban đầu**.
+   Google hỏi thêm quyền **“kết nối tới dịch vụ bên ngoài”** và **“quản lý trình kích hoạt”** → **Cho phép**.
+   Dữ liệu đã có sẽ **không** bị nạp lại. Bước này bật thêm tính năng tự làm mới khi bạn thêm/xóa dòng ngay trong Sheets.
+4. Menu **🥋 Thi thăng đai → Cài đặt cập nhật data.json (GitHub)**: nhập tên kho (ví dụ `lelevietnam99/KEHOACH_THITHANGDAI`), nhánh (`main`), rồi dán mã ở bước 1.
+   Nếu thành công, script ghi luôn `data.json` lần đầu.
+5. **Triển khai phiên bản mới** của Web App: **Triển khai → Quản lý các lần triển khai → ✏️ → Phiên bản mới → Triển khai** (đường link giữ nguyên).
+6. Đưa `index.html`, `capnhat.html`, `.nojekyll` lên nhánh chạy GitHub Pages.
 
-> ⚠️ Phải làm bước 3 (cấp quyền) **trước** bước 4. Nếu chưa cấp quyền mà đã triển khai, Web App sẽ báo lỗi “cần cấp quyền”.
+> ⚠️ Phải làm bước 3 (cấp quyền) **trước** bước 5. Nếu triển khai khi chưa cấp quyền, Web App sẽ báo lỗi “cần cấp quyền” cho tới khi bạn chạy bước 3.
 
 ### Sử dụng
 

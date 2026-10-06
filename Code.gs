@@ -26,7 +26,7 @@ const PROP_KEY = 'MA_QUAN_TRI';            // Mã quản trị (bảo vệ thao 
 const PROP_SHEET_ID = 'SPREADSHEET_ID';    // Chỉ cần khi script KHÔNG gắn với Google Sheet
 const PROP_VER = 'PHIEN_BAN_DU_LIEU';      // Tự đổi mỗi khi dữ liệu thay đổi (để làm mới bộ nhớ đệm)
 const CACHE_PREFIX = 'getAll:v2:';
-const CACHE_TTL = 300;                     // Bộ nhớ đệm tự hết hạn sau 5 phút
+const CACHE_TTL = 120;                     // Lưới an toàn: bộ nhớ đệm tự hết hạn sau 2 phút
 
 // Ghi data.json lên GitHub (tùy chọn). Cài đặt qua menu "🥋 Thi thăng đai → Cài đặt cập nhật data.json".
 const PROP_GH_TOKEN = 'GITHUB_TOKEN';      // Mã truy cập GitHub (fine-grained, quyền Contents: Read and write)
@@ -121,7 +121,6 @@ const SETTING_DATES = ['ngayThi', 'chuanBiTu', 'chuanBiDen'];
 let SS_MEMO_ = null;
 let TZ_MEMO_ = null;
 let PROPS_MEMO_ = null;
-let READ_ONLY_ = false;
 
 // ------------------------- WEB APP / API -------------------------
 
@@ -183,19 +182,16 @@ function api(req) {
 // ----------------------------- NGHIỆP VỤ -----------------------------
 
 /**
- * Đọc toàn bộ kế hoạch. Ưu tiên lấy từ bộ nhớ đệm; khóa của bộ nhớ đệm gắn với
- * "phiên bản dữ liệu", nên mọi thay đổi (qua web hoặc sửa tay trong Sheets) đều
- * tự làm bộ nhớ đệm cũ hết hiệu lực. fresh = bỏ qua bộ nhớ đệm.
+ * Đọc toàn bộ kế hoạch. Ưu tiên lấy từ bộ nhớ đệm (không cần khóa). Khóa của bộ
+ * nhớ đệm gắn với "phiên bản dữ liệu", đổi sau mỗi lần ghi qua web, khi sửa tay
+ * trong Sheets (onEdit) và khi thêm/xóa dòng, trang tính (trình kích hoạt onChange).
+ * fresh = bỏ qua bộ nhớ đệm.
  */
 function getAll_(fresh) {
   const t0 = Date.now();
-  const key = CACHE_PREFIX + (getProp_(PROP_VER) || '0'); // lấy phiên bản TRƯỚC khi đọc dữ liệu
-  let data = fresh ? null : cacheGet_(key);
+  let data = fresh ? null : cacheGet_(CACHE_PREFIX + (getProp_(PROP_VER) || '0'));
   const hit = !!data;
-  if (!data) {
-    data = readFresh_();
-    cachePut_(key, data);
-  }
+  if (!data) data = readFresh_(!fresh);
   data.meta.authRequired = !!getProp_(PROP_KEY);
   data.meta.publish = publishInfo_();
   data.meta.cached = hit;
@@ -203,29 +199,32 @@ function getAll_(fresh) {
   return data;
 }
 
-/** Đọc thẳng từ Google Sheets: không khóa; nếu cần tạo trang tính / cấp ID thì khóa rồi đọc lại. */
-function readFresh_() {
-  try {
-    return readAll_(true);
-  } catch (e) {
-    if (e.code !== 'NEEDS_WRITE') throw e;
-    return withLock_(() => readAll_(false));
-  }
+/**
+ * Đọc thẳng từ Google Sheets DƯỚI KHÓA (không đọc trúng lúc một thao tác nhiều bước
+ * như "dời lịch" đang ghi dở), rồi lưu vào bộ nhớ đệm. useCache = trong lúc chờ khóa,
+ * nếu lượt khác vừa đọc xong thì dùng luôn kết quả của lượt đó.
+ */
+function readFresh_(useCache) {
+  return withLock_(() => {
+    PROPS_MEMO_ = null; // phiên bản dữ liệu có thể vừa đổi trong lúc chờ khóa
+    const key = CACHE_PREFIX + (getProp_(PROP_VER) || '0');
+    const cached = useCache ? cacheGet_(key) : null;
+    if (cached) return cached;
+    const data = readAll_(false);
+    cachePut_(key, data);
+    return data;
+  });
 }
 
-function readAll_(readOnly) {
-  READ_ONLY_ = readOnly;
-  try {
-    const data = {};
-    Object.keys(TABLES).forEach(name => {
-      data[name] = readRows_(table_(name)).map(r => r.item);
-    });
-    data.settings = settingsFromValues_(settingsSheet_().values);
-    data.meta = { sheetUrl: ss_().getUrl() };
-    return data;
-  } finally {
-    READ_ONLY_ = false;
-  }
+/** Đọc toàn bộ (gọi khi đang giữ khóa; được phép tạo trang tính / cấp ID còn thiếu). */
+function readAll_() {
+  const data = {};
+  Object.keys(TABLES).forEach(name => {
+    data[name] = readRows_(table_(name)).map(r => r.item);
+  });
+  data.settings = settingsFromValues_(settingsSheet_().values);
+  data.meta = { sheetUrl: ss_().getUrl() };
+  return data;
 }
 
 function createItem_(name, input) {
@@ -372,10 +371,9 @@ function table_(name) {
   const def = TABLES[name];
   const ss = ss_();
   let sh = ss.getSheetByName(def.sheet);
-  if (!sh) { needWrite_(); sh = ss.insertSheet(def.sheet); }
+  if (!sh) { sh = ss.insertSheet(def.sheet); }
   let values = sh.getDataRange().getDisplayValues();
   if (isBlank_(values)) {
-    needWrite_();
     values = [def.cols.map(c => c[1])];
     sh.getRange(1, 1, 1, values[0].length).setValues(values);
     formatSheet_(sh, def.cols);
@@ -385,7 +383,6 @@ function table_(name) {
   def.cols.forEach(([key, label]) => {
     let idx = header.indexOf(label);
     if (idx < 0) { // Tự thêm cột còn thiếu vào cuối bảng
-      needWrite_();
       idx = header.length;
       header.push(label);
       sh.getRange(1, idx + 1).setValue(label).setFontWeight('bold');
@@ -416,7 +413,6 @@ function readRows_(t) {
     const item = {};
     keys.forEach(k => { item[k] = cleanRead_(k, cells[t.map[k]]); });
     if (!item.id || seen[item.id]) {
-      needWrite_();
       item.id = newId_();
       t.sh.getRange(i + 2, t.map.id + 1).setNumberFormat('@').setValue(item.id);
       cells[t.map.id] = item.id;
@@ -480,10 +476,9 @@ function maxThuTu_(t) {
 function settingsSheet_() {
   const ss = ss_();
   let sh = ss.getSheetByName(SETTINGS_SHEET);
-  if (!sh) { needWrite_(); sh = ss.insertSheet(SETTINGS_SHEET); }
+  if (!sh) { sh = ss.insertSheet(SETTINGS_SHEET); }
   let values = sh.getDataRange().getDisplayValues();
   if (isBlank_(values)) {
-    needWrite_();
     values = [['Mục', 'Giá trị', 'Khóa (không sửa)']];
     sh.getRange(1, 1, 1, 3).setValues(values);
     formatSheet_(sh, [['muc', '', 300], ['giaTri', '', 320], ['khoa', '', 140]]);
@@ -493,7 +488,6 @@ function settingsSheet_() {
   const keys = values.map(r => String(r[2] || '').trim());
   const missing = SETTINGS.filter(s => keys.indexOf(s[0]) < 0);
   if (missing.length) {
-    needWrite_();
     const rows = missing.map(([key, label, def]) => [label, def, key]);
     sh.getRange(values.length + 1, 1, rows.length, 3).setNumberFormat('@').setValues(rows);
     values = values.concat(rows);
@@ -533,9 +527,8 @@ function dataPart_(all) {
 
 /** Đọc mới từ Google Sheets và dựng nội dung data.json. Đồng thời làm mới bộ nhớ đệm của getAll. */
 function buildSnapshot_() {
-  const version = getProp_(PROP_VER) || '0'; // lấy phiên bản TRƯỚC khi đọc dữ liệu
-  const all = readFresh_();
-  cachePut_(CACHE_PREFIX + version, all);
+  const all = readFresh_(false);
+  const version = getProp_(PROP_VER) || '0';
   const data = dataPart_(all);
   const snap = {
     format: SNAPSHOT_FORMAT,
@@ -697,13 +690,15 @@ function bumpVersion_() {
   PROPS_MEMO_ = null;
 }
 
-/** Thao tác ghi: khóa để tránh ghi chồng lên nhau, xong thì làm mới bộ nhớ đệm. */
+/** Thao tác ghi: khóa để tránh ghi chồng lên nhau; đổi phiên bản dữ liệu ngay trong khóa. */
 function writeOp_(fn) {
-  try {
-    return withLock_(fn);
-  } finally {
-    bumpVersion_();
-  }
+  return withLock_(() => {
+    try {
+      return fn();
+    } finally {
+      bumpVersion_();
+    }
+  });
 }
 
 function withLock_(fn) {
@@ -716,11 +711,6 @@ function withLock_(fn) {
   } finally {
     lock.releaseLock();
   }
-}
-
-/** Đang ở chế độ chỉ đọc mà cần ghi (tạo trang tính, cấp ID...) -> báo để chạy lại kèm khóa. */
-function needWrite_() {
-  if (READ_ONLY_) throw err_('NEEDS_WRITE', 'NEEDS_WRITE');
 }
 
 // ----------------------------- TIỆN ÍCH -----------------------------
@@ -886,13 +876,31 @@ function onEdit() {
   bumpVersion_();
 }
 
+/** Trình kích hoạt "Khi thay đổi" (thêm/xóa dòng, cột, trang tính...) — onEdit không bắt được các thay đổi này. */
+function khiThayDoiCauTruc() {
+  bumpVersion_();
+}
+
+/** Cài trình kích hoạt "Khi thay đổi" (một lần). Trả về true nếu vừa cài mới. */
+function caiTrinhKichHoat_() {
+  const exists = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'khiThayDoiCauTruc');
+  if (exists) return false;
+  ScriptApp.newTrigger('khiThayDoiCauTruc').forSpreadsheet(ss_()).onChange().create();
+  return true;
+}
+
 /** Chạy hàm này 1 lần (từ trình soạn thảo hoặc menu) để tạo trang tính và dữ liệu mẫu. */
 function caiDatBanDau() {
   const res = writeOp_(() => seed_(false));
   const total = Object.keys(res.added).reduce((s, k) => s + res.added[k], 0);
-  const msg = total
+  let msg = total
     ? 'Đã tạo các trang tính và nạp ' + total + ' dòng dữ liệu mẫu.'
     : 'Các trang tính đã có dữ liệu nên không nạp thêm dữ liệu mẫu.';
+  try {
+    if (caiTrinhKichHoat_()) msg += ' Đã bật tự làm mới khi thêm/xóa dòng trong Sheets.';
+  } catch (e) {
+    msg += ' (Chưa bật được tự làm mới khi xóa dòng: ' + e.message + ')';
+  }
   try { ss_().toast(msg, 'Thi thăng đai', 6); } catch (e) { /* chạy từ trình soạn thảo */ }
   Logger.log(msg);
 }
@@ -957,6 +965,7 @@ function menuCaiDatGitHub() {
     }
     props.setProperties({ [PROP_GH_REPO]: repo, [PROP_GH_BRANCH]: branch, [PROP_GH_TOKEN]: token });
     PROPS_MEMO_ = null;
+    try { caiTrinhKichHoat_(); } catch (e) { /* không bắt buộc */ }
     const res = publish_(true);
     ui.alert('Đã kết nối GitHub và ghi data.json' + (res.commit ? ' (commit ' + res.commit + ')' : '') +
       '.\nGitHub Pages sẽ phát hành bản mới sau khoảng 1 phút.');
