@@ -184,6 +184,10 @@ const ICON = {
   warn: '<svg viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>',
 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const VER_RE = /^\d{15}-/;
+const isNewerVersion = (a, b) => VER_RE.test(String(a || '')) && VER_RE.test(String(b || '')) && String(a) > String(b);
+// Trang web đã phát hành bản này (hoặc một bản còn mới hơn)?
+const pagesHas = (pj, res) => !!pj && (pj.hash === res.hash || isNewerVersion(pj.version, res.version));
 
 // ---------- Gọi Apps Script ----------
 async function api(action, params = {}) {
@@ -283,7 +287,8 @@ async function refresh() {
   $('#sheetSub').textContent = countText(st.current.counts);
   $('#cfgInfo').innerHTML = st.configured
     ? `Ghi vào <b>${esc(st.repo)}</b> · nhánh <b>${esc(st.branch)}</b> · tự động sau khi sửa: <b>${st.auto ? 'bật' : 'tắt'}</b>`
-      + (st.last && st.last.at ? ` · lần ghi gần nhất ${esc(ago(st.last.at))}${st.last.commitUrl ? ` (<a href="${esc(st.last.commitUrl)}" target="_blank" rel="noopener">commit ${esc(st.last.commit)}</a>)` : ''}` : '')
+      + (st.last && st.last.lastCommit ? ` · lần ghi gần nhất ${esc(ago(st.last.lastCommit.at))}${st.last.lastCommit.commitUrl ? ` (<a href="${esc(st.last.lastCommit.commitUrl)}" target="_blank" rel="noopener">commit ${esc(st.last.lastCommit.commit)}</a>)` : ''}` : '')
+      + (st.last && st.last.error ? `<br><span style="color:var(--red)">Lần cập nhật gần nhất (${esc(ago(st.last.at))}) bị lỗi: ${esc(st.last.error)}</span>` : '')
     : '<b>Chưa cài mã GitHub</b> — xem “Cài đặt lần đầu” bên dưới, hoặc cập nhật thủ công.';
 
   if (!pj) setVerdict('warn', 'Trang web chưa có data.json — lần mở đầu sẽ chậm hơn. Hãy cập nhật để tạo file.');
@@ -310,15 +315,20 @@ async function publish() {
   try {
     const res = await apiWithKey('publish', { force: $('#force').checked });
     steps[0].state = 'done';
-    if (!res.changed) {
-      steps[0].detail = 'Dữ liệu không thay đổi so với data.json trên GitHub — không cần ghi lại.';
+    steps[0].detail = res.changed
+      ? (res.commitUrl ? `Đã ghi — <a href="${esc(res.commitUrl)}" target="_blank" rel="noopener">commit ${esc(res.commit)}</a>` : 'Đã ghi.')
+      : res.throttled ? 'Dữ liệu không đổi và vừa ghi cách đây chưa tới 20 giây — không ghi lại.'
+        : res.newer ? 'data.json trên GitHub đã là bản mới hơn (vừa được cập nhật) — không ghi đè.'
+          : 'Dữ liệu không thay đổi so với data.json trên GitHub — không cần ghi lại.';
+    let pj0 = null;
+    try { pj0 = await readPages(); } catch (e) { /* bỏ qua */ }
+    if (!res.changed && pagesHas(pj0, res)) {
       steps[1].state = 'done';
-      steps[1].detail = 'Không có gì mới để phát hành.';
+      steps[1].detail = 'Trang web đã có bản này — không có gì mới để phát hành.';
       renderSteps(steps);
       await refresh();
       return;
     }
-    steps[0].detail = res.commitUrl ? `Đã ghi — <a href="${esc(res.commitUrl)}" target="_blank" rel="noopener">commit ${esc(res.commit)}</a>` : 'Đã ghi.';
     steps[1].state = 'run';
     steps[1].detail = 'Thường mất 30–90 giây…';
     renderSteps(steps);
@@ -328,7 +338,7 @@ async function publish() {
       const sec = Math.round((Date.now() - t0) / 1000);
       let pj = null;
       try { pj = await readPages(); } catch (e) { /* thử lại */ }
-      if (pj && pj.hash === res.hash) {
+      if (pagesHas(pj, res)) {
         steps[1].state = 'done';
         steps[1].detail = `Đã phát hành sau ${sec} giây. Trang kế hoạch giờ mở ra là thấy ngay dữ liệu mới.`;
         break;

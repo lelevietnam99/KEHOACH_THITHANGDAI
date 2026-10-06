@@ -192,6 +192,7 @@ function getAll_(fresh) {
   let data = fresh ? null : cacheGet_(CACHE_PREFIX + (getProp_(PROP_VER) || '0'));
   const hit = !!data;
   if (!data) data = readFresh_(!fresh);
+  data.meta.version = getProp_(PROP_VER) || '0';
   data.meta.authRequired = !!getProp_(PROP_KEY);
   data.meta.publish = publishInfo_();
   data.meta.cached = hit;
@@ -541,18 +542,19 @@ function buildSnapshot_() {
 }
 
 function publishInfo_() {
+  const last = lastPublish_();
   return {
     configured: !!(getProp_(PROP_GH_TOKEN) && getProp_(PROP_GH_REPO)),
     auto: getProp_(PROP_PUB_AUTO) !== 'off',
+    lastError: last && last.error ? String(last.error) : '',
   };
 }
 
 /** Trạng thái cho trang capnhat.html (không bao giờ trả mã truy cập GitHub). */
 function publishStatus_() {
-  const all = getAll_(false);
+  const all = readFresh_(false);
   const info = publishInfo_();
-  let last = null;
-  try { last = JSON.parse(getProp_(PROP_PUB_LAST) || 'null'); } catch (e) { last = null; }
+  const last = lastPublish_();
   return {
     configured: info.configured,
     auto: info.auto,
@@ -564,24 +566,50 @@ function publishStatus_() {
       hash: sha256_(JSON.stringify(dataPart_(all))),
       counts: { chuanBi: all.chuanBi.length, ngayThi: all.ngayThi.length, hauKy: all.hauKy.length, nhanSu: all.nhanSu.length },
     },
-    authRequired: all.meta.authRequired,
+    authRequired: !!getProp_(PROP_KEY),
   };
 }
 
-/** Ghi data.json lên GitHub. Bỏ qua nếu nội dung không đổi (trừ khi force). */
+/** true nếu phiên bản a mới hơn b (chỉ so được khi cả hai có dạng thời gian). */
+function isNewerVersion_(a, b) {
+  const re = /^\d{15}-/;
+  return re.test(String(a || '')) && re.test(String(b || '')) && String(a) > String(b);
+}
+
+function lastPublish_() {
+  try { return JSON.parse(getProp_(PROP_PUB_LAST) || 'null'); } catch (e) { return null; }
+}
+
+/** Ghi data.json lên GitHub. Bỏ qua nếu nội dung không đổi (trừ khi force). Lưu lại lỗi nếu có. */
 function publish_(force) {
+  try {
+    return publishInner_(force);
+  } catch (e) {
+    if (e.code !== 'NOT_CONFIGURED') recordPublish_({ changed: false, error: e.message });
+    throw e;
+  }
+}
+
+function publishInner_(force) {
   const cfg = ghConfig_();
   const snap = buildSnapshot_().snap;
+  const last = lastPublish_();
+  const recentCommit = !!(last && last.lastCommit && last.lastCommit.at &&
+    Date.now() - new Date(last.lastCommit.at).getTime() < 20000);
   const url = '/repos/' + cfg.repo + '/contents/' + cfg.path.split('/').map(encodeURIComponent).join('/');
+  let lastMsg = '';
   for (let attempt = 0; attempt < 3; attempt++) {
     const cur = gh_('get', url + '?ref=' + encodeURIComponent(cfg.branch));
     if (cur.code !== 200 && cur.code !== 404) throw ghError_(cur, cfg);
     const sha = cur.code === 200 ? cur.json.sha : null;
-    if (sha && !force) {
-      const old = decodeGhJson_(cur.json.content);
-      if (old && old.hash === snap.hash) {
-        return recordPublish_({ changed: false, hash: snap.hash, version: snap.version, publishedAt: old.publishedAt || '' });
-      }
+    const old = sha ? decodeGhJson_(cur.json.content) : null;
+    if (old && isNewerVersion_(old.version, snap.version)) {
+      // Một lượt khác vừa ghi bản MỚI HƠN -> không ghi đè bằng dữ liệu cũ
+      return recordPublish_({ changed: false, newer: true, hash: old.hash, version: old.version, publishedAt: old.publishedAt || '' });
+    }
+    if (old && old.hash === snap.hash && (!force || recentCommit)) {
+      // Không đổi. "Ghi lại" (force) chỉ được phép cách lần commit trước ít nhất 20 giây (chống tạo hàng loạt commit)
+      return recordPublish_({ changed: false, throttled: !!force, hash: snap.hash, version: snap.version, publishedAt: old.publishedAt || '' });
     }
     const body = {
       message: 'Cập nhật ' + cfg.path + ' từ Google Sheets (' + now_() + ')',
@@ -597,14 +625,21 @@ function publish_(force) {
         commit: commit.sha ? String(commit.sha).slice(0, 7) : '', commitUrl: commit.html_url || '',
       });
     }
-    if (put.code !== 409 && put.code !== 422) throw ghError_(put, cfg);
-    // 409/422: data.json vừa bị người khác ghi -> đọc lại sha rồi thử lại
+    lastMsg = (put.json && put.json.message) || ('HTTP ' + put.code);
+    // Chỉ thử lại khi data.json vừa bị lượt khác ghi (sha đã đổi); lỗi khác báo ngay
+    if (put.code !== 409 && !(put.code === 422 && /sha/i.test(lastMsg))) throw ghError_(put, cfg);
   }
-  throw err_('GitHub đang bận (có người khác cũng đang cập nhật data.json). Vui lòng thử lại sau giây lát.');
+  throw err_('Không ghi được data.json sau 3 lần thử vì file liên tục bị thay đổi (' + lastMsg + '). Vui lòng thử lại sau giây lát.', 'GITHUB');
 }
 
 function recordPublish_(res) {
+  const prev = lastPublish_();
   res.at = new Date().toISOString();
+  // Lần commit gần nhất được giữ riêng: lần bấm "không đổi" / lỗi không che mất thông tin này
+  res.lastCommit = res.changed
+    ? { at: res.at, commit: res.commit || '', commitUrl: res.commitUrl || '', hash: res.hash }
+    : (prev && prev.lastCommit) || null;
+  PROPS_MEMO_ = null;
   try {
     PropertiesService.getScriptProperties().setProperty(PROP_PUB_LAST, JSON.stringify(res));
   } catch (e) { /* không quan trọng */ }
@@ -685,7 +720,8 @@ function cachePut_(key, data) {
 /** Đánh dấu dữ liệu đã thay đổi -> lần tải sau sẽ đọc lại từ Google Sheets. */
 function bumpVersion_() {
   try {
-    PropertiesService.getScriptProperties().setProperty(PROP_VER, newId_());
+    // Dạng "<mili giây, 15 chữ số>-<ngẫu nhiên>": so sánh được bản nào mới hơn
+    PropertiesService.getScriptProperties().setProperty(PROP_VER, String(Date.now()).padStart(15, '0') + '-' + newId_().slice(0, 6));
   } catch (e) { /* bỏ qua: bộ nhớ đệm vẫn tự hết hạn sau CACHE_TTL giây */ }
   PROPS_MEMO_ = null;
 }
@@ -966,20 +1002,24 @@ function menuCaiDatGitHub() {
     props.setProperties({ [PROP_GH_REPO]: repo, [PROP_GH_BRANCH]: branch, [PROP_GH_TOKEN]: token });
     PROPS_MEMO_ = null;
     try { caiTrinhKichHoat_(); } catch (e) { /* không bắt buộc */ }
-    const res = publish_(true);
-    ui.alert('Đã kết nối GitHub và ghi data.json' + (res.commit ? ' (commit ' + res.commit + ')' : '') +
-      '.\nGitHub Pages sẽ phát hành bản mới sau khoảng 1 phút.');
+    ui.alert('Đã kết nối GitHub. ' + publishMessage_(publish_(true)));
   } catch (e) {
     if (e.code !== 'CANCEL') ui.alert('Lỗi: ' + e.message);
   }
 }
 
+function publishMessage_(res) {
+  if (res.changed) return 'Đã ghi data.json lên GitHub' + (res.commit ? ' (commit ' + res.commit + ')' : '') +
+    '.\nGitHub Pages sẽ phát hành bản mới sau khoảng 1 phút.';
+  if (res.newer) return 'data.json trên GitHub đã là bản mới hơn — không cần ghi.';
+  if (res.throttled) return 'data.json vừa được ghi cách đây chưa tới 20 giây và dữ liệu không đổi — không ghi lại.';
+  return 'data.json đã khớp với Google Sheets — không cần ghi lại.';
+}
+
 function menuCapNhatDataJson() {
   const ui = SpreadsheetApp.getUi();
   try {
-    const res = publish_(true);
-    ui.alert('Đã ghi data.json lên GitHub' + (res.commit ? ' (commit ' + res.commit + ')' : '') +
-      '.\nGitHub Pages sẽ phát hành bản mới sau khoảng 1 phút.');
+    ui.alert(publishMessage_(publish_(true)));
   } catch (e) {
     ui.alert('Lỗi: ' + e.message);
   }

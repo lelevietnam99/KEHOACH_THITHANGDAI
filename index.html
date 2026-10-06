@@ -631,10 +631,13 @@ function writeFailed(e) {
   if (e && e.code === 'NETWORK') resyncAfterLostWrite();
 }
 
-/** Mất kết nối giữa lúc ghi: máy chủ có thể đã lưu -> khóa sửa và tải lại cho tới khi chắc chắn. */
+/**
+ * Tải lại sau một lần ghi mà trang chưa có kết quả mới nhất (mất kết nối giữa chừng, dời lịch, nạp mẫu):
+ * khóa sửa cho tới khi tải lại thành công; xong thì cập nhật data.json.
+ */
 function resyncAfterLostWrite() {
   state.stale = true;
-  return load(true);
+  return load(true).then(ok => { if (ok) schedulePublish(); return ok; });
 }
 
 // --------------------------- Hộp thoại ---------------------------
@@ -743,6 +746,9 @@ const DATA_KEYS = ['settings', 'chuanBi', 'ngayThi', 'hauKy', 'nhanSu'];
 const validData = d => !!(d && d.settings && ['chuanBi', 'ngayThi', 'hauKy', 'nhanSu'].every(k => Array.isArray(d[k])));
 const sameData = (a, b) => !!a && !!b && JSON.stringify(DATA_KEYS.map(k => a[k])) === JSON.stringify(DATA_KEYS.map(k => b[k]));
 const inAppsScript = () => !!(window.google && google.script && google.script.run);
+const VER_RE = /^\d{15}-/;
+const isNewerVersion = (a, b) => VER_RE.test(String(a || '')) && VER_RE.test(String(b || '')) && String(a) > String(b);
+const verOf = d => (d && d.meta && d.meta.version) || '';
 
 function readLocal() {
   try {
@@ -761,7 +767,7 @@ async function readDataJson() {
     if (!r.ok) return null;
     const j = await r.json();
     if (!j || j.format !== SNAPSHOT_FORMAT || !validData(j.data)) return null;
-    return Object.assign({}, j.data, { meta: { snapshotAt: j.publishedAt } });
+    return Object.assign({}, j.data, { meta: { snapshotAt: j.publishedAt, version: j.version } });
   } catch (e) {
     return null;
   } finally {
@@ -875,8 +881,17 @@ function runPublish(leaving) {
     if (!navigator.sendBeacon(API_URL, body)) fetch(API_URL, { method: 'POST', body, keepalive: true }).catch(() => {});
     return;
   }
-  api('publish').then(r => { if (r && r.changed) console.info('Đã cập nhật data.json, commit', r.commit); },
-    e => console.warn('Chưa cập nhật được data.json:', e.message));
+  api('publish').then(r => {
+    if (r && r.changed) console.info('Đã cập nhật data.json, commit', r.commit);
+    if (state.data && state.data.meta && state.data.meta.publish) state.data.meta.publish.lastError = '';
+  }, e => {
+    console.warn('Chưa cập nhật được data.json:', e.message);
+    // Người xem không có mã quản trị (AUTH) hoặc mất mạng tạm thời: bỏ qua. Lỗi GitHub: báo để xử lý.
+    if (e.code === 'GITHUB' || e.code === 'ERROR') {
+      toast('Chưa cập nhật được data.json: ' + e.message, 'err');
+      if (state.data && state.data.meta && state.data.meta.publish) state.data.meta.publish.lastError = e.message;
+    }
+  });
 }
 window.addEventListener('pagehide', () => runPublish(true));
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') runPublish(true); });
@@ -1232,7 +1247,8 @@ function publishInfoHtml() {
     ? 'Chưa cài đặt ghi <b>data.json</b> lên GitHub — trang vẫn chạy bình thường nhưng lần mở đầu sẽ chậm hơn. Xem “Trang cập nhật data.json”.'
     : p.auto ? '<b>data.json</b> tự cập nhật khoảng 20 giây sau mỗi lần sửa trên trang này.'
       : 'Tự động cập nhật <b>data.json</b> đang tắt — dùng “Trang cập nhật data.json” khi cần.';
-  return `<div class="hint-box">${msg}${at ? ` Bản data.json đang hiển thị: ${esc(new Date(at).toLocaleString('vi-VN'))}.` : ''}</div>`;
+  const err = p.lastError ? `<p class="form-error">Lần cập nhật data.json gần nhất bị lỗi: ${esc(p.lastError)} — mở “Trang cập nhật data.json” để xử lý.</p>` : '';
+  return `<div class="hint-box">${msg}${at ? ` Bản data.json đang hiển thị: ${esc(new Date(at).toLocaleString('vi-VN'))}.` : ''}${err}</div>`;
 }
 
 const fmtSec = ms => (ms / 1000).toFixed(1).replace('.', ',') + ' giây';
@@ -1302,7 +1318,7 @@ function openForm(name, id, preset) {
 
 $('#itemForm').addEventListener('submit', async e => {
   e.preventDefault();
-  if (!formCtx) return;
+  if (!formCtx || formCtx.busy) return; // chặn bấm Lưu hai lần
   const { name, id } = formCtx;
   const def = TABLES[name];
   const form = e.target, errEl = $('#formError'), btn = $('#formSubmit');
@@ -1325,9 +1341,10 @@ $('#itemForm').addEventListener('submit', async e => {
     errEl.hidden = false;
     return;
   }
-  if (state.stale && !(await ensureFresh())) return;
-  errEl.hidden = true;
+  formCtx.busy = true;
   btn.disabled = true;
+  if (state.stale && !(await ensureFresh())) { formCtx.busy = false; btn.disabled = false; return; }
+  errEl.hidden = true;
   btn.textContent = 'Đang lưu…';
   try {
     const saved = await write(id ? 'update' : 'create', { table: name, id, item });
@@ -1348,6 +1365,7 @@ $('#itemForm').addEventListener('submit', async e => {
       if (err.code === 'NETWORK') resyncAfterLostWrite();
     }
   } finally {
+    formCtx.busy = false;
     btn.disabled = false;
     btn.textContent = id ? 'Lưu thay đổi' : 'Thêm mới';
   }
@@ -1410,7 +1428,8 @@ async function seed(overwrite) {
   }
   try {
     await write('seed', { overwrite });
-    if (await load(true)) { schedulePublish(); toast('Đã nạp dữ liệu mẫu.', 'ok'); }
+    toast('Đã nạp dữ liệu mẫu.', 'ok');
+    await resyncAfterLostWrite();
   } catch (e) { writeFailed(e); }
 }
 
@@ -1557,7 +1576,8 @@ document.addEventListener('submit', async e => {
     // Đọc biểu mẫu TRƯỚC khi chờ đồng bộ (đồng bộ xong có thể vẽ lại biểu mẫu).
     // Chỉ gửi ô đã sửa -> không ghi đè thay đổi của người khác ở các ô còn lại.
     const f = e.target.elements, settings = {};
-    ['tenKeHoach', 'donVi', 'diaDiem'].forEach(k => { if (f[k].value !== f[k].dataset.orig) settings[k] = f[k].value.trim(); });
+    const oneLine = v => String(v).replace(/[\r\n]/g, ''); // trình duyệt tự bỏ xuống dòng trong ô 1 dòng
+    ['tenKeHoach', 'donVi', 'diaDiem'].forEach(k => { if (f[k].value !== oneLine(f[k].dataset.orig)) settings[k] = f[k].value.trim(); });
     ['ngayThi', 'chuanBiTu', 'chuanBiDen'].forEach(k => { if (f[k].value !== f[k].dataset.orig) settings[k] = isoToDMY(f[k].value); });
     if (!Object.keys(settings).length) { toast('Không có thay đổi nào để lưu.'); return; }
     if (!(await ensureFresh())) return;
@@ -1582,8 +1602,8 @@ document.addEventListener('submit', async e => {
     try {
       const res = await write('rollover', { ngayThi: nd, resetStatus: reset });
       document.activeElement.blur();
-      if (await load(true)) schedulePublish();
-      if (state.data && !state.stale) toast(`Đã dời lịch ${res.delta >= 0 ? '+' : ''}${res.delta} ngày.`, 'ok');
+      resyncAfterLostWrite();
+      toast(`Đã dời lịch ${res.delta >= 0 ? '+' : ''}${res.delta} ngày.`, 'ok');
     } catch (err) { writeFailed(err); }
   }
 });
@@ -1598,13 +1618,12 @@ buildShell();
   if (local) showStale(local);
   else switchView(state.view);
   load(false);                                    // 2) hỏi Apps Script ở nền (song song)
-  if (!local) {                                   // 3) lần đầu mở trên máy này: dùng data.json
-    readDataJson().then(d => {
-      if (!d || state.data) return;
-      showStale(d);
-      if (!state.syncing) setSync('offline'); // máy chủ đã báo lỗi trước khi data.json về
-    });
-  }
+  readDataJson().then(d => {                      // 3) data.json: dùng nếu chưa có gì, hoặc mới hơn bản sao
+    if (!d) return;
+    if (state.data && !(state.stale && isNewerVersion(verOf(d), verOf(state.data)))) return;
+    showStale(d);
+    if (!state.syncing) setSync('offline');       // máy chủ đã báo lỗi trước khi data.json về
+  });
 })();
 </script>
 </body>
