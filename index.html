@@ -4,9 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kế hoạch thi thăng đai</title>
+<link rel="preconnect" href="https://script.google.com" crossorigin>
+<link rel="preconnect" href="https://script.googleusercontent.com" crossorigin>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- Tải phông chữ song song, không bắt trang phải chờ -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&display=swap" media="print" onload="this.media='all'">
 <style>
   :root {
     --bg: #f3f5f9;
@@ -59,6 +62,9 @@
   .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .lock-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 10px; border-radius: 999px; background: rgba(255,255,255,.1); color: #dbe3f3; border: 0; cursor: pointer; }
   .lock-badge.ok { background: rgba(246, 201, 14, .18); color: var(--gold); }
+  .sync-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 10px; border-radius: 999px; background: rgba(255,255,255,.1); color: #dbe3f3; border: 0; }
+  .sync-badge.offline { background: rgba(248, 113, 113, .2); color: #fecaca; cursor: pointer; }
+  .sync-badge .dot { width: 11px; height: 11px; border-radius: 50%; border: 2px solid rgba(255,255,255,.3); border-top-color: var(--gold); animation: spin .8s linear infinite; }
   .tabs { max-width: 1280px; margin: 0 auto; padding: 0 8px; display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; }
   .tabs::-webkit-scrollbar { display: none; }
   .tab { background: none; border: 0; color: #c3cde2; padding: 10px 12px 11px; cursor: pointer; white-space: nowrap; border-bottom: 3px solid transparent; font-weight: 500; display: inline-flex; gap: 6px; align-items: center; }
@@ -265,7 +271,7 @@
     .brand > div { min-width: 0; }
     .top-actions { flex-wrap: nowrap; gap: 6px; }
     .top-actions .lbl { display: none; }
-    .top-actions .btn.sm, .lock-badge { padding: 7px; }
+    .top-actions .btn.sm, .lock-badge, .sync-badge { padding: 7px; }
     .data tr.row.is-over { border-left: 3px solid var(--red); }
     .data tr.is-over td:first-child { box-shadow: none; }
     #toasts { left: 12px; right: 12px; bottom: 12px; }
@@ -318,6 +324,7 @@
       </div>
     </div>
     <div class="top-actions">
+      <button class="sync-badge" id="syncBadge" type="button" hidden></button>
       <button class="lock-badge" id="lockBadge" type="button" hidden></button>
       <button class="btn ghost sm" id="btnReload" type="button" aria-label="Tải lại"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg><span class="lbl">Tải lại</span></button>
       <button class="btn ghost sm" id="btnPrintAll" type="button"><svg viewBox="0 0 24 24"><path d="M6 9V2h12v7"/><rect x="2" y="9" width="20" height="9" rx="2"/><path d="M6 14h12v8H6z"/></svg><span class="lbl">In kế hoạch</span></button>
@@ -380,6 +387,10 @@
 
 <div id="toasts" role="status" aria-live="polite"></div>
 
+<!-- Khi chạy trong Apps Script, máy chủ điền sẵn dữ liệu vào đây để trang mở nhanh hơn.
+     Trên GitHub Pages dòng này không có tác dụng (trang tự gọi máy chủ). -->
+<script type="application/json" id="initialData"><?!= initialData ?></script>
+
 <script>
 'use strict';
 
@@ -405,6 +416,7 @@ const ICON = {
   search: '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
   print: '<svg viewBox="0 0 24 24"><path d="M6 9V2h12v7"/><rect x="2" y="9" width="20" height="9" rx="2"/><path d="M6 14h12v8H6z"/></svg>',
   lock: '<svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+  alert: '<svg viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>',
 };
 
 // Cấu hình từng bảng: các ô trong biểu mẫu Thêm/Sửa
@@ -537,27 +549,55 @@ function setPending(delta) {
   $('#progress').classList.toggle('on', pending > 0);
 }
 
+const TIMEOUT_MS = 60000;
+
+function netError(detail) {
+  return Object.assign(new Error('Không kết nối được tới máy chủ Google Apps Script'
+    + (detail ? ' (' + detail + ')' : '') + '. Hãy kiểm tra mạng Internet rồi thử lại.'), { code: 'NETWORK' });
+}
+
 function callServer(payload) {
   if (window.google && google.script && google.script.run) {
     return new Promise((resolve, reject) => {
-      google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).api(payload);
+      google.script.run.withSuccessHandler(resolve)
+        .withFailureHandler(e => reject(netError(e && e.message)))
+        .api(payload);
     });
   }
   if (!API_URL) return Promise.reject(Object.assign(new Error('Chưa cấu hình API_URL'), { code: 'NO_API' }));
-  return fetch(API_URL, { method: 'POST', body: JSON.stringify(payload) }).then(r => {
-    if (!r.ok) throw new Error('Máy chủ trả lỗi ' + r.status);
-    return r.json();
-  });
+  const ctrl = window.AbortController ? new AbortController() : null;
+  const timer = ctrl && setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  return fetch(API_URL, { method: 'POST', body: JSON.stringify(payload), signal: ctrl ? ctrl.signal : undefined })
+    .then(r => {
+      if (!r.ok) throw netError('HTTP ' + r.status);
+      return r.text();
+    }, e => {
+      throw netError(e && e.name === 'AbortError' ? 'quá ' + TIMEOUT_MS / 1000 + ' giây không phản hồi' : e && e.message);
+    })
+    .then(text => {
+      try { return JSON.parse(text); } catch (e) {
+        throw netError('máy chủ trả về trang lỗi thay vì dữ liệu — kiểm tra Web App đã triển khai với quyền “Bất kỳ ai” và đúng phiên bản mới nhất');
+      }
+    })
+    .finally(() => { if (timer) clearTimeout(timer); });
 }
 
-async function api(action, params = {}) {
+/** Gọi API. retries = số lần tự thử lại khi mất kết nối (chỉ dùng cho thao tác đọc). */
+async function api(action, params = {}, retries = 0) {
   setPending(1);
   try {
-    const res = await callServer(Object.assign({ action, key: store.get('key', '') }, params));
-    if (!res || !res.ok) {
-      throw Object.assign(new Error((res && res.error) || 'Lỗi không xác định.'), { code: res && res.code });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await callServer(Object.assign({ action, key: store.get('key', '') }, params));
+        if (!res || !res.ok) {
+          throw Object.assign(new Error((res && res.error) || 'Lỗi không xác định.'), { code: (res && res.code) || 'ERROR' });
+        }
+        return res.data;
+      } catch (e) {
+        if (e.code !== 'NETWORK' || attempt >= retries) throw e;
+        await new Promise(r => setTimeout(r, 1000));
+      }
     }
-    return res.data;
   } finally {
     setPending(-1);
   }
@@ -578,6 +618,12 @@ async function write(action, params) {
 function showError(e) {
   if (e && e.code === 'CANCEL') return;
   toast((e && e.message) || String(e), 'err');
+}
+
+/** Lỗi khi ghi. Mất kết nối giữa chừng thì máy chủ có thể đã lưu xong -> tải lại để hiển thị đúng. */
+function writeFailed(e) {
+  showError(e);
+  if (e && e.code === 'NETWORK') load(true);
 }
 
 // --------------------------- Hộp thoại ---------------------------
@@ -625,6 +671,7 @@ function askKey(message) {
         store.set('key', prev || null);
         errEl.textContent = err.message;
         errEl.hidden = false;
+      errEl.scrollIntoView({ block: 'nearest' });
       } finally {
         btn.disabled = false;
       }
@@ -677,18 +724,83 @@ function peopleNames() {
 
 function findItem(name, id) { return (state.data[name] || []).find(i => i.id === id); }
 
-async function load() {
+// Bản sao dữ liệu lần trước trong trình duyệt -> mở trang là thấy ngay, không phải chờ máy chủ.
+const LOCAL_KEY = 'data:' + (API_URL || 'apps-script');
+let syncPromise = null;
+
+function readLocal() {
   try {
-    state.data = await api('getAll');
+    const d = JSON.parse(store.get(LOCAL_KEY, '') || 'null');
+    const ok = d && d.settings && ['chuanBi', 'ngayThi', 'hauKy', 'nhanSu'].every(k => Array.isArray(d[k]));
+    return ok ? d : null;
+  } catch (e) { return null; }
+}
+
+function saveLocal() {
+  if (state.data && !state.stale) store.set(LOCAL_KEY, JSON.stringify(state.data));
+}
+
+/** Dữ liệu máy chủ gửi kèm trong trang (chỉ có khi chạy trong Apps Script). */
+function readInitial() {
+  try {
+    const el = document.getElementById('initialData');
+    const res = el && JSON.parse(el.textContent);
+    return res && res.ok && res.data ? res.data : null;
+  } catch (e) { return null; }
+}
+
+function setSync(mode) {
+  const b = $('#syncBadge');
+  b.hidden = !mode;
+  b.className = 'sync-badge' + (mode ? ' ' + mode : '');
+  b.disabled = mode === 'syncing';
+  b.innerHTML = mode === 'syncing' ? '<span class="dot"></span><span class="lbl">Đang đồng bộ…</span>'
+    : mode === 'offline' ? ICON.alert + '<span class="lbl">Chưa đồng bộ · Thử lại</span>' : '';
+  b.title = mode === 'offline' ? 'Đang hiển thị dữ liệu lưu lần trước. Bấm để tải lại.' : 'Đang tải dữ liệu mới nhất từ Google Sheets';
+}
+
+function applyData(data) {
+  state.data = data;
+  state.stale = false;
+  setSync('');
+  $('#loading').hidden = true;
+  $$('.load-error').forEach(el => el.remove());
+  renderAll();
+  switchView(state.view);
+}
+
+/** Tải dữ liệu mới nhất. fresh = bỏ qua bộ nhớ đệm của máy chủ. Trả về true/false, không ném lỗi. */
+function load(fresh) {
+  if (state.data) setSync('syncing');
+  state.syncing = true;
+  const t0 = performance.now();
+  syncPromise = api('getAll', fresh ? { fresh: true } : {}, 1).then(data => {
+    const meta = data.meta || {};
+    state.lastLoad = { ms: Math.round(performance.now() - t0), serverMs: meta.serverMs, cached: !!meta.cached };
+    state.syncing = false;
+    applyData(data);
+    return true;
+  }, e => {
+    state.syncing = false;
     $('#loading').hidden = true;
-    renderAll();
-    switchView(state.view);
-  } catch (e) {
-    $('#loading').hidden = true;
-    if (state.data) throw e;
-    if (e.code === 'NO_API') return showSetupScreen();
-    showLoadError(e);
-  }
+    if (state.data) {
+      setSync(state.stale ? 'offline' : '');
+      toast((state.stale ? 'Chưa tải được dữ liệu mới nhất, đang hiển thị dữ liệu lưu lần trước. ' : '') + e.message, 'err');
+    } else if (e.code === 'NO_API') showSetupScreen();
+    else showLoadError(e);
+    return false;
+  });
+  return syncPromise;
+}
+
+/** Trước khi sửa: bảo đảm đang có dữ liệu mới nhất (tránh ghi đè bằng dữ liệu cũ). */
+async function ensureFresh() {
+  if (!state.stale) return true;
+  toast('Đang đồng bộ dữ liệu mới nhất, vui lòng đợi giây lát…');
+  await (state.syncing ? syncPromise : load(false));
+  if (!state.stale) return true;
+  toast('Chưa tải được dữ liệu mới nhất nên tạm thời chưa thể chỉnh sửa. Bấm “Tải lại” để thử lại.', 'err');
+  return false;
 }
 
 // --------------------------- Khung giao diện ---------------------------
@@ -1001,6 +1113,7 @@ function renderSettings() {
     <div class="card">
       <h3>Dữ liệu</h3>
       <p class="muted" style="margin:0">Toàn bộ dữ liệu được lưu trong Google Sheets. Bạn có thể mở và chỉnh sửa trực tiếp ở đó (không đổi tên dòng tiêu đề và tên trang tính).</p>
+      ${loadInfo()}
       <div class="row-actions">
         ${meta.sheetUrl ? `<a class="btn ghost" href="${esc(meta.sheetUrl)}" target="_blank" rel="noopener">Mở Google Sheets</a>` : ''}
         <button class="btn danger-ghost" type="button" data-seed="1">Nạp lại dữ liệu mẫu (xóa dữ liệu hiện có)</button>
@@ -1018,6 +1131,15 @@ function renderSettings() {
           ${hasKey ? '<button class="btn ghost sm" type="button" id="btnForgetKey">Quên mã trên máy này</button>' : ''}` : ''}
       </div>
     </div>`;
+}
+
+const fmtSec = ms => (ms / 1000).toFixed(1).replace('.', ',') + ' giây';
+function loadInfo() {
+  const l = state.lastLoad;
+  if (!l) return '';
+  const server = l.serverMs != null
+    ? ` — máy chủ xử lý ${fmtSec(l.serverMs)}, ${l.cached ? 'lấy từ bộ nhớ đệm' : 'đọc trực tiếp Google Sheets'}` : '';
+  return `<div class="hint-box">Lần tải dữ liệu gần nhất: <b>${fmtSec(l.ms)}</b>${server}.</div>`;
 }
 
 function updateLockBadge() {
@@ -1090,6 +1212,7 @@ $('#itemForm').addEventListener('submit', async e => {
     if (f.required && !val) {
       errEl.textContent = `Vui lòng nhập “${f.label}”.`;
       errEl.hidden = false;
+      errEl.scrollIntoView({ block: 'nearest' });
       el.focus();
       return;
     }
@@ -1113,8 +1236,12 @@ $('#itemForm').addEventListener('submit', async e => {
     toast(id ? 'Đã lưu thay đổi.' : 'Đã thêm ' + def.noun + ' mới.', 'ok');
   } catch (err) {
     if (err.code !== 'CANCEL') {
-      errEl.textContent = err.message;
+      errEl.textContent = err.code === 'NETWORK'
+        ? err.message + ' Thay đổi có thể đã hoặc chưa được lưu — trang đang tải lại dữ liệu, hãy kiểm tra trước khi bấm lưu lần nữa.'
+        : err.message;
       errEl.hidden = false;
+      errEl.scrollIntoView({ block: 'nearest' });
+      if (err.code === 'NETWORK') load(true);
     }
   } finally {
     btn.disabled = false;
@@ -1144,24 +1271,23 @@ async function removeItem(name, id) {
     state.data[name] = state.data[name].filter(i => i.id !== id);
     renderAll();
     toast('Đã xóa.', 'ok');
-  } catch (e) { showError(e); }
+  } catch (e) { writeFailed(e); }
 }
 
 async function changeStatus(sel) {
-  const name = sel.dataset.status, id = sel.dataset.id;
+  const name = sel.dataset.status, id = sel.dataset.id, value = sel.value;
+  sel.className = 'status-select st-' + STATUS_CLS[value];
+  if (!(await ensureFresh())) { renderAll(); return; }
   const it = findItem(name, id);
-  if (!it) return;
-  const prev = it.trangThai;
-  sel.className = 'status-select st-' + STATUS_CLS[sel.value];
+  if (!it) { renderAll(); toast('Mục này không còn trong kế hoạch (có thể đã bị xóa).', 'err'); return; }
   try {
-    const saved = await write('update', { table: name, id, item: { trangThai: sel.value } });
+    const saved = await write('update', { table: name, id, item: { trangThai: value } });
     Object.assign(it, saved);
     renderAll();
     toast(`Đã chuyển “${it[TABLES[name].nameKey]}” sang “${saved.trangThai}”.`, 'ok');
   } catch (e) {
-    sel.value = prev;
-    sel.className = 'status-select st-' + STATUS_CLS[prev];
-    showError(e);
+    renderAll(); // trả ô trạng thái về giá trị cũ
+    writeFailed(e);
   }
 }
 
@@ -1172,9 +1298,8 @@ async function seed(overwrite) {
   }
   try {
     await write('seed', { overwrite });
-    await load();
-    toast('Đã nạp dữ liệu mẫu.', 'ok');
-  } catch (e) { showError(e); }
+    if (await load(true)) toast('Đã nạp dữ liệu mẫu.', 'ok');
+  } catch (e) { writeFailed(e); }
 }
 
 // --------------------------- Bản in ---------------------------
@@ -1234,11 +1359,11 @@ function showSetupScreen() {
 
 function showLoadError(e) {
   $('#appSub').textContent = 'Không tải được dữ liệu';
-  $('#main').insertAdjacentHTML('beforeend', `<div class="card setup">
+  $('#main').insertAdjacentHTML('beforeend', `<div class="card setup load-error">
     <h3>Không tải được dữ liệu</h3>
     <p class="form-error">${esc(e.message || e)}</p>
     <p class="muted">Kiểm tra lại: Web App đã được triển khai với quyền truy cập phù hợp, và đã cấp quyền cho script truy cập Google Sheets.</p>
-    <div class="row-actions"><button class="btn primary" type="button" onclick="location.reload()">Thử lại</button></div></div>`);
+    <div class="row-actions"><button class="btn primary" type="button" data-retry>Thử lại</button></div></div>`);
 }
 
 // --------------------------- Vẽ lại toàn bộ ---------------------------
@@ -1249,27 +1374,31 @@ function renderAll() {
   document.title = (s.tenKeHoach || 'Kế hoạch thi thăng đai') + (s.ngayThi ? ' – ' + s.ngayThi : '');
   Object.keys(TABLES).forEach(renderTable);
   renderDashboard();
-  renderSettings();
+  if (!$('#view-caiDat').contains(document.activeElement)) renderSettings();
   updateLockBadge();
+  saveLocal();
 }
 
 // --------------------------- Sự kiện ---------------------------
 document.addEventListener('click', e => {
   const t = e.target.closest('button, a');
   if (!t) return;
-  const ds = t.dataset;
+  const ds = Object.assign({}, t.dataset);
+  const guard = fn => ensureFresh().then(ok => { if (ok) fn(); });
   if (ds.tab) switchView(ds.tab);
-  else if (ds.add) openForm(ds.add, null, ds.group != null ? { nhom: ds.group } : null);
-  else if (ds.edit) openForm(ds.edit, ds.id);
-  else if (ds.dup) {
+  else if (ds.add) guard(() => openForm(ds.add, null, ds.group != null ? { nhom: ds.group } : null));
+  else if (ds.edit) guard(() => openForm(ds.edit, ds.id));
+  else if (ds.dup) guard(() => {
     const it = findItem(ds.dup, ds.id);
     if (it) openForm(ds.dup, null, Object.assign({}, it, { id: '', thuTu: '', trangThai: STATUS[0] }));
-  }
-  else if (ds.del) removeItem(ds.del, ds.id);
+    else toast('Mục này không còn trong kế hoạch (có thể đã bị xóa).', 'err');
+  });
+  else if (ds.del) guard(() => removeItem(ds.del, ds.id));
   else if (ds.print) printPlan([ds.print]);
-  else if (ds.seed != null) seed(ds.seed === '1');
+  else if (ds.seed != null) guard(() => seed(ds.seed === '1'));
+  else if (ds.retry != null) { $$('.load-error').forEach(el => el.remove()); $('#loading').hidden = false; load(true); }
   else if (ds.person != null) { state.person = ds.person; $('#personInput').value = ds.person; renderPerson(); }
-  else if (t.id === 'btnReload') load().then(() => state.data && toast('Đã tải lại dữ liệu mới nhất.', 'ok'), showError);
+  else if (t.id === 'btnReload' || t.id === 'syncBadge') load(true).then(ok => ok && toast('Đã tải lại dữ liệu mới nhất.', 'ok'));
   else if (t.id === 'btnPrintAll') { if (state.data) printPlan(['chuanBi', 'ngayThi', 'hauKy', 'nhanSu']); }
   else if (t.id === 'lockBadge' || t.id === 'btnEnterKey') askKey('Nhập mã quản trị để mở khóa chỉnh sửa trên trình duyệt này.').then(ok => ok && renderSettings());
   else if (t.id === 'btnForgetKey') { store.set('key', null); updateLockBadge(); renderSettings(); toast('Đã xóa mã khỏi trình duyệt này.'); }
@@ -1299,16 +1428,19 @@ document.addEventListener('change', e => {
 document.addEventListener('submit', async e => {
   if (e.target.id === 'settingsForm') {
     e.preventDefault();
+    if (!(await ensureFresh())) return;
     const f = e.target.elements, settings = {};
     ['tenKeHoach', 'donVi', 'diaDiem'].forEach(k => { settings[k] = f[k].value.trim(); });
     ['ngayThi', 'chuanBiTu', 'chuanBiDen'].forEach(k => { settings[k] = isoToDMY(f[k].value); });
     try {
       state.data.settings = await write('saveSettings', { settings });
+      document.activeElement.blur();
       renderAll();
       toast('Đã lưu thông tin kỳ thi.', 'ok');
-    } catch (err) { showError(err); }
+    } catch (err) { writeFailed(err); }
   } else if (e.target.id === 'rolloverForm') {
     e.preventDefault();
+    if (!(await ensureFresh())) return;
     const nd = isoToDMY($('#r_date').value);
     if (!nd) { toast('Hãy chọn ngày thi mới.', 'err'); return; }
     const reset = $('#r_reset').checked;
@@ -1319,17 +1451,28 @@ document.addEventListener('submit', async e => {
     if (!ok) return;
     try {
       const res = await write('rollover', { ngayThi: nd, resetStatus: reset });
-      await load();
-      toast(`Đã dời lịch ${res.delta >= 0 ? '+' : ''}${res.delta} ngày.`, 'ok');
-    } catch (err) { showError(err); }
+      document.activeElement.blur();
+      if (await load(true)) toast(`Đã dời lịch ${res.delta >= 0 ? '+' : ''}${res.delta} ngày.`, 'ok');
+    } catch (err) { writeFailed(err); }
   }
 });
 
 window.addEventListener('afterprint', () => { $('#printArea').innerHTML = ''; });
 
 buildShell();
-switchView(state.view);
-load();
+(function boot() {
+  const initial = readInitial();
+  if (initial) { applyData(initial); return; }      // chạy trong Apps Script: có sẵn dữ liệu
+  const cached = readLocal();
+  if (cached) {                                      // hiện ngay dữ liệu lần trước, đồng bộ ở nền
+    state.data = cached;
+    state.stale = true;
+    $('#loading').hidden = true;
+    renderAll();
+  }
+  switchView(state.view);
+  load(false);
+})();
 </script>
 </body>
 </html>

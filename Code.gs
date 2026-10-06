@@ -6,6 +6,9 @@
  *  - Cung cấp API cho giao diện (file Index.html): đọc / thêm / sửa / xóa.
  *  - Cách cài đặt từng bước: xem README.md.
  *
+ *  Tốc độ: mỗi trang tính chỉ được đọc 1 lần cho mỗi lượt tải, và kết quả được
+ *  giữ trong bộ nhớ đệm (CacheService) cho tới khi dữ liệu thay đổi.
+ *
  *  Có thể sửa trực tiếp trong Google Sheets, KHÔNG đổi tên dòng tiêu đề
  *  (dòng 1) và KHÔNG đổi tên các trang tính bên dưới.
  */
@@ -17,8 +20,11 @@ const BUOI = ['', 'Sáng', 'Chiều', 'Tối'];
 const DATE_FIELDS = ['deadline'];
 const TIME_FIELDS = ['batDau', 'ketThuc'];
 const MAX_LEN = 5000;
-const PROP_KEY = 'MA_QUAN_TRI';         // Mã quản trị (bảo vệ thao tác sửa/xóa)
-const PROP_SHEET_ID = 'SPREADSHEET_ID'; // Chỉ cần khi script KHÔNG gắn với Google Sheet
+const PROP_KEY = 'MA_QUAN_TRI';            // Mã quản trị (bảo vệ thao tác sửa/xóa)
+const PROP_SHEET_ID = 'SPREADSHEET_ID';    // Chỉ cần khi script KHÔNG gắn với Google Sheet
+const PROP_VER = 'PHIEN_BAN_DU_LIEU';      // Tự đổi mỗi khi dữ liệu thay đổi (để làm mới bộ nhớ đệm)
+const CACHE_PREFIX = 'getAll:v2:';
+const CACHE_TTL = 300;                     // Bộ nhớ đệm tự hết hạn sau 5 phút
 
 // Mỗi cột: [khóa nội bộ, tiêu đề trong Google Sheets, độ rộng cột]
 const TABLES = {
@@ -100,14 +106,24 @@ const SETTINGS = [
 ];
 const SETTING_DATES = ['ngayThi', 'chuanBiTu', 'chuanBiDen'];
 
+// Bộ nhớ tạm trong MỘT lần chạy script (mỗi lần gọi API là một lần chạy mới).
+let SS_MEMO_ = null;
+let TZ_MEMO_ = null;
+let PROPS_MEMO_ = null;
+let READ_ONLY_ = false;
+
 // ------------------------- WEB APP / API -------------------------
 
 /** Mở trang web. Thêm ?action=getAll vào URL để xem dữ liệu dạng JSON. */
 function doGet(e) {
-  if (e && e.parameter && e.parameter.action === 'getAll') {
-    return json_(api({ action: 'getAll' }));
+  const p = (e && e.parameter) || {};
+  if (p.action === 'getAll') {
+    return json_(api({ action: 'getAll', fresh: p.fresh === '1' }));
   }
-  return HtmlService.createHtmlOutputFromFile('Index')
+  // Gửi kèm dữ liệu ngay trong trang -> trình duyệt không phải gọi máy chủ thêm lần nữa.
+  const t = HtmlService.createTemplateFromFile('Index');
+  t.initialData = JSON.stringify(api({ action: 'getAll' })).replace(/</g, '\\u003c');
+  return t.evaluate()
     .setTitle('Kế hoạch thi thăng đai')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1');
 }
@@ -123,25 +139,28 @@ function doPost(e) {
   return json_(api(req));
 }
 
+// auth: cần mã quản trị · write: thay đổi dữ liệu (khóa ghi + làm mới bộ nhớ đệm)
 const ACTIONS = {
-  getAll: { run: () => getAll_() },
-  checkKey: { write: true, run: () => true },
-  create: { write: true, run: req => createItem_(req.table, req.item) },
-  update: { write: true, run: req => updateItem_(req.table, req.id, req.item) },
-  remove: { write: true, run: req => removeItem_(req.table, req.id) },
-  saveSettings: { write: true, run: req => saveSettings_(req.settings) },
-  seed: { write: true, run: req => seed_(!!req.overwrite) },
-  rollover: { write: true, run: req => rollover_(req.ngayThi, !!req.resetStatus) },
+  getAll: { run: req => getAll_(!!req.fresh) },
+  checkKey: { auth: true, run: () => true },
+  create: { auth: true, write: true, run: req => createItem_(req.table, req.item) },
+  update: { auth: true, write: true, run: req => updateItem_(req.table, req.id, req.item) },
+  remove: { auth: true, write: true, run: req => removeItem_(req.table, req.id) },
+  saveSettings: { auth: true, write: true, run: req => saveSettings_(req.settings) },
+  seed: { auth: true, write: true, run: req => seed_(!!req.overwrite) },
+  rollover: { auth: true, write: true, run: req => rollover_(req.ngayThi, !!req.resetStatus) },
 };
 
 /** Điểm vào duy nhất của API (gọi qua google.script.run hoặc doPost). */
 function api(req) {
   try {
     req = req || {};
-    const handler = ACTIONS[String(req.action || '')];
-    if (!handler) throw err_('Thao tác không hợp lệ: ' + req.action);
-    if (handler.write) checkKey_(req.key);
-    return { ok: true, data: withLock_(() => handler.run(req)) };
+    const action = String(req.action || '');
+    if (!Object.prototype.hasOwnProperty.call(ACTIONS, action)) throw err_('Thao tác không hợp lệ: ' + action);
+    const handler = ACTIONS[action];
+    if (handler.auth) checkKey_(req.key);
+    const data = handler.write ? writeOp_(() => handler.run(req)) : handler.run(req);
+    return { ok: true, data: data };
   } catch (e) {
     return { ok: false, error: (e && e.message) || String(e), code: (e && e.code) || 'ERROR' };
   }
@@ -149,17 +168,44 @@ function api(req) {
 
 // ----------------------------- NGHIỆP VỤ -----------------------------
 
-function getAll_() {
-  const data = {};
-  Object.keys(TABLES).forEach(name => {
-    data[name] = readRows_(table_(name)).map(r => r.item);
-  });
-  data.settings = readSettings_();
-  data.meta = {
-    authRequired: !!getProp_(PROP_KEY),
-    sheetUrl: ss_().getUrl(),
-  };
+/**
+ * Đọc toàn bộ kế hoạch. Ưu tiên lấy từ bộ nhớ đệm; khóa của bộ nhớ đệm gắn với
+ * "phiên bản dữ liệu", nên mọi thay đổi (qua web hoặc sửa tay trong Sheets) đều
+ * tự làm bộ nhớ đệm cũ hết hiệu lực. fresh = bỏ qua bộ nhớ đệm.
+ */
+function getAll_(fresh) {
+  const t0 = Date.now();
+  const key = CACHE_PREFIX + (getProp_(PROP_VER) || '0'); // lấy phiên bản TRƯỚC khi đọc dữ liệu
+  let data = fresh ? null : cacheGet_(key);
+  const hit = !!data;
+  if (!data) {
+    try {
+      data = readAll_(true);                    // chỉ đọc, không cần khóa
+    } catch (e) {
+      if (e.code !== 'NEEDS_WRITE') throw e;
+      data = withLock_(() => readAll_(false));  // lần đầu: cần tạo trang tính / cấp ID -> khóa rồi đọc lại
+    }
+    cachePut_(key, data);
+  }
+  data.meta.authRequired = !!getProp_(PROP_KEY);
+  data.meta.cached = hit;
+  data.meta.serverMs = Date.now() - t0;
   return data;
+}
+
+function readAll_(readOnly) {
+  READ_ONLY_ = readOnly;
+  try {
+    const data = {};
+    Object.keys(TABLES).forEach(name => {
+      data[name] = readRows_(table_(name)).map(r => r.item);
+    });
+    data.settings = settingsFromValues_(settingsSheet_().values);
+    data.meta = { sheetUrl: ss_().getUrl() };
+    return data;
+  } finally {
+    READ_ONLY_ = false;
+  }
 }
 
 function createItem_(name, input) {
@@ -170,21 +216,21 @@ function createItem_(name, input) {
   item.id = newId_();
   item.capNhat = now_();
   validateRequired_(name, item);
-  writeRow_(t, t.sh.getLastRow() + 1, item);
+  writeRows_(t, t.rows.length + 2, [item]);
   return pick_(t, item);
 }
 
 function updateItem_(name, id, input) {
   const t = table_(name);
   const rowNum = findRow_(t, id);
-  const cur = t.sh.getRange(rowNum, 1, 1, t.width).getDisplayValues()[0];
+  const cur = t.rows[rowNum - 2];
   const item = {};
   Object.keys(t.map).forEach(k => { item[k] = cleanRead_(k, cur[t.map[k]]); });
   Object.assign(item, sanitize_(name, input, false));
   item.id = String(id);
   item.capNhat = now_();
   validateRequired_(name, item);
-  writeRow_(t, rowNum, item);
+  writeRows_(t, rowNum, [item]);
   return pick_(t, item);
 }
 
@@ -199,9 +245,8 @@ function removeItem_(name, id) {
 
 function saveSettings_(input) {
   input = input || {};
-  const s = settingsSheet_();
-  const values = s.sh.getRange(1, 1, s.sh.getLastRow(), 3).getDisplayValues();
-  SETTINGS.forEach(([key, label]) => {
+  const next = {};
+  SETTINGS.forEach(([key, label]) => { // kiểm tra hết trước, rồi mới ghi
     if (!(key in input)) return;
     let v = String(input[key] == null ? '' : input[key]).trim();
     if (v.length > 300) throw err_('"' + label + '" quá dài.');
@@ -210,10 +255,16 @@ function saveSettings_(input) {
       if (!d) throw err_('Ngày không hợp lệ ở mục "' + label + '": ' + v);
       v = d;
     }
-    const r = values.findIndex(row => String(row[2]).trim() === key);
-    if (r >= 0) s.sh.getRange(r + 1, 2).setNumberFormat('@').setValue(safeCell_(v));
+    next[key] = v;
   });
-  return readSettings_();
+  const s = settingsSheet_();
+  Object.keys(next).forEach(key => {
+    const r = s.values.findIndex(row => String(row[2] || '').trim() === key);
+    if (r < 0) return;
+    s.sh.getRange(r + 1, 2).setNumberFormat('@').setValue(safeCell_(next[key]));
+    s.values[r][1] = next[key];
+  });
+  return settingsFromValues_(s.values);
 }
 
 /** Nạp dữ liệu mẫu (theo kế hoạch PDF 07/06/2026). overwrite = xóa dữ liệu cũ. */
@@ -221,29 +272,29 @@ function seed_(overwrite) {
   const added = {};
   Object.keys(DU_LIEU_MAU).forEach(name => {
     const t = table_(name);
-    const last = t.sh.getLastRow();
-    if (last > 1) {
+    if (!isBlank_(t.rows)) {
       if (!overwrite) { added[name] = 0; return; }
-      t.sh.getRange(2, 1, last - 1, t.sh.getLastColumn()).clearContent();
+      t.sh.getRange(2, 1, t.rows.length, t.width).clearContent();
     }
     const stamp = now_();
-    DU_LIEU_MAU[name].forEach((raw, i) => {
+    const items = DU_LIEU_MAU[name].map((raw, i) => {
       const item = sanitize_(name, raw, true);
       item.id = newId_();
       item.capNhat = stamp;
       if ('thuTu' in t.map && !item.thuTu) item.thuTu = String(i + 1);
       if ('trangThai' in t.map && !item.trangThai) item.trangThai = TRANG_THAI[0];
-      writeRow_(t, i + 2, item);
+      return item;
     });
-    added[name] = DU_LIEU_MAU[name].length;
+    writeRows_(t, 2, items);
+    added[name] = items.length;
   });
-  const s = settingsSheet_();
+  settingsSheet_();
   if (overwrite) {
     const defaults = {};
     SETTINGS.forEach(([key, , def]) => { defaults[key] = def; });
     saveSettings_(defaults);
   }
-  return { added: added, settingsSheet: s.sh.getName() };
+  return { added: added };
 }
 
 /**
@@ -262,12 +313,13 @@ function rollover_(newDate, resetStatus) {
     const hasDeadline = 'deadline' in t.map;
     const hasStatus = 'trangThai' in t.map;
     if (!hasDeadline && !(hasStatus && resetStatus)) return;
-    readRows_(t).forEach(({ row, item }) => {
+    const entries = readRows_(t);
+    entries.forEach(({ item }) => {
       if (hasDeadline && toDMY_(item.deadline)) item.deadline = shiftDMY_(item.deadline, delta);
       if (hasStatus && resetStatus) item.trangThai = TRANG_THAI[0];
       item.capNhat = stamp;
-      writeRow_(t, row, item);
     });
+    writeEntries_(t, entries);
   });
   const next = { ngayThi: nd };
   ['chuanBiTu', 'chuanBiDen'].forEach(k => {
@@ -280,32 +332,40 @@ function rollover_(newDate, resetStatus) {
 // --------------------------- TRUY CẬP SHEET ---------------------------
 
 function ss_() {
+  if (SS_MEMO_) return SS_MEMO_;
   const id = getProp_(PROP_SHEET_ID);
   const ss = id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
     throw err_('Không tìm thấy Google Sheet. Hãy mở Apps Script từ menu "Tiện ích mở rộng" của Google Sheet, ' +
       'hoặc khai báo thuộc tính tập lệnh ' + PROP_SHEET_ID + '.');
   }
+  SS_MEMO_ = ss;
   return ss;
 }
 
-/** Lấy (hoặc tạo) trang tính của một bảng và bản đồ khóa -> vị trí cột. */
+/**
+ * Lấy (hoặc tạo) trang tính của một bảng. Đọc cả trang tính bằng MỘT lệnh gọi.
+ * Trả về: sh, map (khóa -> vị trí cột), width, rows (giá trị các dòng dữ liệu; rows[i] là dòng i + 2).
+ */
 function table_(name) {
+  if (!Object.prototype.hasOwnProperty.call(TABLES, name)) throw err_('Bảng dữ liệu không tồn tại: ' + name);
   const def = TABLES[name];
-  if (!def) throw err_('Bảng dữ liệu không tồn tại: ' + name);
   const ss = ss_();
   let sh = ss.getSheetByName(def.sheet);
-  if (!sh) sh = ss.insertSheet(def.sheet);
-  if (sh.getLastRow() === 0) {
-    sh.getRange(1, 1, 1, def.cols.length).setValues([def.cols.map(c => c[1])]);
+  if (!sh) { needWrite_(); sh = ss.insertSheet(def.sheet); }
+  let values = sh.getDataRange().getDisplayValues();
+  if (isBlank_(values)) {
+    needWrite_();
+    values = [def.cols.map(c => c[1])];
+    sh.getRange(1, 1, 1, values[0].length).setValues(values);
     formatSheet_(sh, def.cols);
   }
-  const header = sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), 1)).getDisplayValues()[0]
-    .map(h => String(h).trim());
+  const header = values[0].map(h => String(h).trim());
   const map = {};
   def.cols.forEach(([key, label]) => {
     let idx = header.indexOf(label);
     if (idx < 0) { // Tự thêm cột còn thiếu vào cuối bảng
+      needWrite_();
       idx = header.length;
       header.push(label);
       sh.getRange(1, idx + 1).setValue(label).setFontWeight('bold');
@@ -313,7 +373,7 @@ function table_(name) {
     }
     map[key] = idx;
   });
-  return { sh: sh, map: map, width: header.length };
+  return { sh: sh, map: map, width: header.length, rows: values.slice(1) };
 }
 
 function formatSheet_(sh, cols) {
@@ -326,21 +386,20 @@ function formatSheet_(sh, cols) {
   if (cols[0][0] === 'id') sh.hideColumns(1);
 }
 
-/** Đọc mọi dòng có dữ liệu. Dòng thiếu ID hoặc trùng ID sẽ được cấp ID mới. */
+/** Các dòng có dữ liệu: [{row, item}]. Dòng thiếu ID hoặc trùng ID sẽ được cấp ID mới. */
 function readRows_(t) {
-  const last = t.sh.getLastRow();
-  if (last < 2) return [];
-  const values = t.sh.getRange(2, 1, last - 1, t.width).getDisplayValues();
   const keys = Object.keys(t.map);
   const seen = {};
   const out = [];
-  values.forEach((cells, i) => {
+  t.rows.forEach((cells, i) => {
     if (cells.every(v => String(v).trim() === '')) return;
     const item = {};
     keys.forEach(k => { item[k] = cleanRead_(k, cells[t.map[k]]); });
     if (!item.id || seen[item.id]) {
+      needWrite_();
       item.id = newId_();
       t.sh.getRange(i + 2, t.map.id + 1).setNumberFormat('@').setValue(item.id);
+      cells[t.map.id] = item.id;
     }
     seen[item.id] = true;
     out.push({ row: i + 2, item: item });
@@ -349,73 +408,144 @@ function readRows_(t) {
 }
 
 function findRow_(t, id) {
-  id = String(id || '');
-  const last = t.sh.getLastRow();
-  if (id && last >= 2) {
-    const ids = t.sh.getRange(2, t.map.id + 1, last - 1, 1).getDisplayValues();
-    for (let i = 0; i < ids.length; i++) {
-      if (String(ids[i][0]).trim() === id) return i + 2;
+  id = String(id || '').trim();
+  if (id) {
+    for (let i = 0; i < t.rows.length; i++) {
+      if (String(t.rows[i][t.map.id] || '').trim() === id) return i + 2;
     }
   }
   throw err_('Không tìm thấy dữ liệu (có thể đã bị xóa). Hãy bấm "Tải lại".', 'NOT_FOUND');
 }
 
-/** Ghi các cột đã biết của một dòng (không đụng tới cột người dùng tự thêm). */
-function writeRow_(t, rowNum, item) {
+/** Ghi nhiều dòng liền nhau bắt đầu từ startRow (chỉ các cột đã biết, không đụng cột người dùng tự thêm). */
+function writeRows_(t, startRow, items) {
+  if (!items.length) return;
   const keys = Object.keys(t.map);
   const idxs = keys.map(k => t.map[k]);
   const min = Math.min.apply(null, idxs);
   const max = Math.max.apply(null, idxs);
   if (max - min + 1 === keys.length) {
-    const row = new Array(keys.length);
-    keys.forEach(k => { row[t.map[k] - min] = safeCell_(item[k]); });
-    t.sh.getRange(rowNum, min + 1, 1, keys.length).setNumberFormat('@').setValues([row]);
-  } else {
-    keys.forEach(k => {
-      t.sh.getRange(rowNum, t.map[k] + 1).setNumberFormat('@').setValue(safeCell_(item[k]));
+    const block = items.map(item => {
+      const row = new Array(keys.length);
+      keys.forEach(k => { row[t.map[k] - min] = safeCell_(item[k]); });
+      return row;
     });
+    t.sh.getRange(startRow, min + 1, items.length, keys.length).setNumberFormat('@').setValues(block);
+  } else {
+    items.forEach((item, i) => keys.forEach(k => {
+      t.sh.getRange(startRow + i, t.map[k] + 1).setNumberFormat('@').setValue(safeCell_(item[k]));
+    }));
+  }
+}
+
+/** Ghi lại các dòng [{row, item}], gộp các dòng liền nhau thành một lệnh ghi. */
+function writeEntries_(t, entries) {
+  let start = 0;
+  for (let i = 1; i <= entries.length; i++) {
+    if (i === entries.length || entries[i].row !== entries[i - 1].row + 1) {
+      writeRows_(t, entries[start].row, entries.slice(start, i).map(e => e.item));
+      start = i;
+    }
   }
 }
 
 function maxThuTu_(t) {
-  return readRows_(t).reduce((m, r) => {
-    const n = parseInt(r.item.thuTu, 10);
+  return t.rows.reduce((m, cells) => {
+    const n = parseInt(cells[t.map.thuTu], 10);
     return isNaN(n) ? m : Math.max(m, n);
   }, 0);
 }
 
+/** Trang tính Cài đặt: {sh, values}. Tự tạo trang tính và các mục còn thiếu. */
 function settingsSheet_() {
   const ss = ss_();
   let sh = ss.getSheetByName(SETTINGS_SHEET);
-  if (!sh) sh = ss.insertSheet(SETTINGS_SHEET);
-  if (sh.getLastRow() === 0) {
-    sh.getRange(1, 1, 1, 3).setValues([['Mục', 'Giá trị', 'Khóa (không sửa)']]);
+  if (!sh) { needWrite_(); sh = ss.insertSheet(SETTINGS_SHEET); }
+  let values = sh.getDataRange().getDisplayValues();
+  if (isBlank_(values)) {
+    needWrite_();
+    values = [['Mục', 'Giá trị', 'Khóa (không sửa)']];
+    sh.getRange(1, 1, 1, 3).setValues(values);
     formatSheet_(sh, [['muc', '', 300], ['giaTri', '', 320], ['khoa', '', 140]]);
     sh.getRange(1, 3, sh.getMaxRows(), 1).setFontColor('#888888');
     sh.getRange(1, 1, 1, 3).setFontColor('#cc0000');
   }
-  const last = sh.getLastRow();
-  const keys = sh.getRange(1, 3, last, 1).getDisplayValues().map(r => String(r[0]).trim());
+  const keys = values.map(r => String(r[2] || '').trim());
   const missing = SETTINGS.filter(s => keys.indexOf(s[0]) < 0);
   if (missing.length) {
-    sh.getRange(last + 1, 1, missing.length, 3).setNumberFormat('@')
-      .setValues(missing.map(([key, label, def]) => [label, def, key]));
+    needWrite_();
+    const rows = missing.map(([key, label, def]) => [label, def, key]);
+    sh.getRange(values.length + 1, 1, rows.length, 3).setNumberFormat('@').setValues(rows);
+    values = values.concat(rows);
   }
-  return { sh: sh };
+  return { sh: sh, values: values };
 }
 
 function readSettings_() {
-  const s = settingsSheet_();
-  const values = s.sh.getRange(1, 1, s.sh.getLastRow(), 3).getDisplayValues();
+  return settingsFromValues_(settingsSheet_().values);
+}
+
+function settingsFromValues_(values) {
   const out = {};
   SETTINGS.forEach(([key, , def]) => { out[key] = def; });
   values.forEach(row => {
-    const key = String(row[2]).trim();
-    if (!(key in out)) return;
-    const v = String(row[1]).trim();
+    const key = String(row[2] || '').trim();
+    if (!Object.prototype.hasOwnProperty.call(out, key)) return;
+    const v = String(row[1] == null ? '' : row[1]).trim();
     out[key] = SETTING_DATES.indexOf(key) >= 0 ? (toDMY_(v) || v) : v;
   });
   return out;
+}
+
+// ------------------------- BỘ NHỚ ĐỆM / KHÓA -------------------------
+
+function cacheGet_(key) {
+  try {
+    const raw = CacheService.getScriptCache().get(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function cachePut_(key, data) {
+  try {
+    CacheService.getScriptCache().put(key, JSON.stringify(data), CACHE_TTL);
+  } catch (e) { /* dữ liệu quá lớn (>100KB) hoặc bộ nhớ đệm lỗi: bỏ qua, lần sau đọc trực tiếp */ }
+}
+
+/** Đánh dấu dữ liệu đã thay đổi -> lần tải sau sẽ đọc lại từ Google Sheets. */
+function bumpVersion_() {
+  try {
+    PropertiesService.getScriptProperties().setProperty(PROP_VER, newId_());
+  } catch (e) { /* bỏ qua: bộ nhớ đệm vẫn tự hết hạn sau CACHE_TTL giây */ }
+  PROPS_MEMO_ = null;
+}
+
+/** Thao tác ghi: khóa để tránh ghi chồng lên nhau, xong thì làm mới bộ nhớ đệm. */
+function writeOp_(fn) {
+  try {
+    return withLock_(fn);
+  } finally {
+    bumpVersion_();
+  }
+}
+
+function withLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) throw err_('Hệ thống đang bận, vui lòng thử lại sau giây lát.');
+  try {
+    const result = fn();
+    SpreadsheetApp.flush();
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Đang ở chế độ chỉ đọc mà cần ghi (tạo trang tính, cấp ID...) -> báo để chạy lại kèm khóa. */
+function needWrite_() {
+  if (READ_ONLY_) throw err_('NEEDS_WRITE', 'NEEDS_WRITE');
 }
 
 // ----------------------------- TIỆN ÍCH -----------------------------
@@ -479,6 +609,10 @@ function pick_(t, item) {
   return out;
 }
 
+function isBlank_(values) {
+  return values.every(row => row.every(v => String(v).trim() === ''));
+}
+
 /** Chặn Google Sheets hiểu nội dung bắt đầu bằng "=" là công thức. */
 function safeCell_(v) {
   const s = v == null ? '' : String(v);
@@ -523,33 +657,24 @@ function shiftDMY_(s, days) {
 function pad2_(n) { return (n < 10 ? '0' : '') + n; }
 
 function now_() {
-  return Utilities.formatDate(new Date(), ss_().getSpreadsheetTimeZone(), 'dd/MM/yyyy HH:mm');
+  if (!TZ_MEMO_) TZ_MEMO_ = ss_().getSpreadsheetTimeZone();
+  return Utilities.formatDate(new Date(), TZ_MEMO_, 'dd/MM/yyyy HH:mm');
 }
 
 function newId_() {
   return Utilities.getUuid().replace(/-/g, '').slice(0, 12);
 }
 
+/** Thuộc tính tập lệnh: chỉ đọc 1 lần cho mỗi lần chạy. */
 function getProp_(k) {
-  return PropertiesService.getScriptProperties().getProperty(k) || '';
+  if (!PROPS_MEMO_) PROPS_MEMO_ = PropertiesService.getScriptProperties().getProperties();
+  return PROPS_MEMO_[k] || '';
 }
 
 function checkKey_(key) {
   const k = getProp_(PROP_KEY);
   if (k && String(key || '') !== k) {
     throw err_(key ? 'Mã quản trị không đúng.' : 'Cần nhập mã quản trị để chỉnh sửa.', 'AUTH');
-  }
-}
-
-function withLock_(fn) {
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(20000)) throw err_('Hệ thống đang bận, vui lòng thử lại sau giây lát.');
-  try {
-    const result = fn();
-    SpreadsheetApp.flush();
-    return result;
-  } finally {
-    lock.releaseLock();
   }
 }
 
@@ -577,9 +702,14 @@ function onOpen() {
     .addToUi();
 }
 
+/** Sửa trực tiếp trong Google Sheets -> làm mới bộ nhớ đệm để trang web thấy ngay thay đổi. */
+function onEdit() {
+  bumpVersion_();
+}
+
 /** Chạy hàm này 1 lần (từ trình soạn thảo hoặc menu) để tạo trang tính và dữ liệu mẫu. */
 function caiDatBanDau() {
-  const res = withLock_(() => seed_(false));
+  const res = writeOp_(() => seed_(false));
   const total = Object.keys(res.added).reduce((s, k) => s + res.added[k], 0);
   const msg = total
     ? 'Đã tạo các trang tính và nạp ' + total + ' dòng dữ liệu mẫu.'
@@ -625,7 +755,7 @@ function menuNapLaiDuLieuMau() {
   const ui = SpreadsheetApp.getUi();
   if (ui.alert('Nạp lại dữ liệu mẫu?', 'Toàn bộ dữ liệu hiện có ở 4 trang tính kế hoạch sẽ bị XÓA và thay bằng dữ liệu mẫu.',
     ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
-  withLock_(() => seed_(true));
+  writeOp_(() => seed_(true));
   ui.alert('Đã nạp lại dữ liệu mẫu.');
 }
 
